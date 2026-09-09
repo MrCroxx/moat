@@ -121,6 +121,7 @@ impl UringQueue {
         token: u64,
         buf: Option<PooledBuf>,
     ) {
+        self.inboxes.start(desc);
         self.staged.push(entry);
         self.slots[slot as usize] = Some(Slot { desc, token, buf });
     }
@@ -145,7 +146,7 @@ impl UringQueue {
 
     fn reap(&mut self) -> usize {
         let mut n = 0;
-        let mut cq = self.ring.completion();
+        let (submitter, _, mut cq) = self.ring.split();
         cq.sync();
         for cqe in &mut cq {
             let slot = cqe.user_data() as u32;
@@ -157,7 +158,9 @@ impl UringQueue {
             };
             let Slot { desc, token, buf } = self.slots[slot as usize].take().expect("completion for a live slot");
             self.free_slots.push(slot);
-            self.inboxes.deliver(desc, IoCompletion { token, result, buf });
+            if self.inboxes.deliver(desc, IoCompletion { token, result, buf }) {
+                let _ = submitter.register_files_update(desc.0, &[-1 as RawFd]);
+            }
             n += 1;
         }
         n
@@ -198,13 +201,11 @@ impl IoQueue for UringQueue {
     }
 
     fn detach(&mut self, desc: Descriptor) {
-        if !self.inboxes.is_open(desc) {
-            return;
+        // Staged SQEs still refer to this fixed-file slot. Keep the binding
+        // until every accepted operation has completed, including staged ones.
+        if self.inboxes.close(desc) {
+            let _ = self.ring.submitter().register_files_update(desc.0, &[-1 as RawFd]);
         }
-        self.inboxes.close(desc);
-        // Unregistering while operations are in flight is allowed: the kernel
-        // keeps its own reference for them.
-        let _ = self.ring.submitter().register_files_update(desc.0, &[-1 as RawFd]);
     }
 
     fn read(
@@ -215,7 +216,7 @@ impl IoQueue for UringQueue {
         offset: u64,
         token: u64,
     ) -> Result<(), PooledBuf> {
-        debug_assert!(len <= buf.capacity());
+        assert!(len <= buf.capacity(), "I/O length exceeds buffer capacity");
         let Some(slot) = self.free_slots.pop() else {
             return Err(buf);
         };
@@ -235,7 +236,7 @@ impl IoQueue for UringQueue {
         offset: u64,
         token: u64,
     ) -> Result<(), PooledBuf> {
-        debug_assert!(len <= buf.capacity());
+        assert!(len <= buf.capacity(), "I/O length exceeds buffer capacity");
         let Some(slot) = self.free_slots.pop() else {
             return Err(buf);
         };
@@ -260,8 +261,8 @@ impl IoQueue for UringQueue {
     }
 
     fn submit(&mut self) -> io::Result<()> {
-        if !self.staged.is_empty() {
-            self.stage_to_ring();
+        self.stage_to_ring();
+        if !self.ring.submission().is_empty() {
             self.ring.submit()?;
         }
         Ok(())
@@ -272,7 +273,7 @@ impl IoQueue for UringQueue {
         if wait && in_flight > 0 {
             self.enter(1)?;
         } else if self.deferred {
-            if in_flight > 0 || !self.staged.is_empty() {
+            if in_flight > 0 {
                 self.enter(0)?;
             }
         } else {
@@ -300,6 +301,36 @@ mod tests {
 
     use super::*;
     use crate::device::FileDevice;
+
+    #[test]
+    fn oversized_io_is_rejected_before_reserving_a_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let device: Arc<dyn Device> = Arc::new(FileDevice::create(dir.path().join("disk.img"), 8192, false).unwrap());
+        let mut queue = UringQueue::new(&crate::io::tests::detach_options()).unwrap();
+        let desc = queue.attach(&device).unwrap();
+        for read in [true, false] {
+            let buf = queue.pool().alloc(4096).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if read {
+                    queue.read(desc, buf, 8192, 0, 1)
+                } else {
+                    queue.write(desc, buf, 8192, 0, 1)
+                }
+            }));
+            assert!(result.is_err());
+            assert_eq!(queue.in_flight(), 0);
+            assert_eq!(queue.pool().in_use(), 0);
+        }
+    }
+
+    #[test]
+    fn detached_descriptors_keep_staged_writes_on_the_original_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(FileDevice::create(dir.path().join("a.img"), 4096, false).unwrap());
+        let b = Arc::new(FileDevice::create(dir.path().join("b.img"), 4096, false).unwrap());
+        let mut queue = UringQueue::new(&crate::io::tests::detach_options()).unwrap();
+        crate::io::tests::check_detach(&mut queue, a, b);
+    }
 
     #[test]
     fn fixed_buffer_write_then_read_on_two_devices() {

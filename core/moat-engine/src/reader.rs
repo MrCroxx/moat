@@ -323,6 +323,9 @@ impl Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
+        for pending in self.pending.iter().flatten() {
+            self.shared.segments.unpin(pending.value.loc.seg_no);
+        }
         // The slot is a `Copy`-free token; hand it back by value.
         let slot = std::mem::replace(&mut self.slot, ReaderSlot::detached());
         if !slot.is_detached() {

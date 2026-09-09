@@ -1808,3 +1808,47 @@ fn scan_window_boundary_footer_recovery() {
 fn scan_window_boundary_reclaim() {
     check_scan_window_boundary("reclaim");
 }
+
+#[test]
+fn dropping_a_reader_releases_pins_for_submitted_and_queued_reads() {
+    for detach in [false, true] {
+        let device = new_device(4);
+        let (engine, mut q, mut writer, reader) = setup(&device);
+        put(&mut q, &mut writer, id(1), b"value", PutOptions::default());
+        seal(&mut q, &mut writer);
+        reader.detach(&mut q);
+        let mut read_queue = SyncQueue::new(
+            &QueueOptions {
+                depth: 1,
+                ..queue_options()
+            },
+            CompletionOrder::Fifo,
+        )
+        .unwrap();
+        let mut reader = engine.reader(&mut read_queue).unwrap();
+        // One read is accepted by the queue; the other waits in the reader.
+        reader.get(&mut read_queue, &id(1), None, 1).unwrap();
+        reader.get(&mut read_queue, &id(1), None, 2).unwrap();
+        if detach {
+            reader.detach(&mut read_queue);
+        } else {
+            drop(reader);
+        }
+        let ticket = writer.reclaim(&mut q, ReclaimPolicy::Storage).unwrap().unwrap();
+        let mut done = Vec::new();
+        let mut reclaimed = false;
+        for _ in 0..100 {
+            q.poll(false).unwrap();
+            writer.poll(&mut q, &mut done).unwrap();
+            if let Some(c) = done.iter().find(|c| c.ticket == ticket) {
+                assert!(matches!(c.result, Ok(Outcome::Reclaim(_))));
+                reclaimed = true;
+                break;
+            }
+        }
+        assert!(reclaimed, "abandoned reads must not keep reclaim pinned");
+        read_queue.poll(false).unwrap();
+        let mut reader = engine.reader(&mut q).unwrap();
+        assert_eq!(read(&mut q, &mut reader, &id(1)).unwrap(), b"value");
+    }
+}

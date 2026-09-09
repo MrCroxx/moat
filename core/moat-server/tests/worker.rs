@@ -165,7 +165,8 @@ impl Handler for Load {
             self.reads_total.fetch_add(self.reads_done as usize, Ordering::AcqRel);
             return Step::Stop;
         }
-        Step::Continue
+        // All available reads have been issued; adaptive mode may wait for I/O.
+        Step::Idle
     }
 }
 

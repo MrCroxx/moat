@@ -69,7 +69,8 @@ pub struct Arena {
 // SAFETY: the arena exclusively owns its mapping; sharing the owner across
 // threads is no different from sharing a `Box<[u8]>`.
 unsafe impl Send for Arena {}
-// SAFETY: as above; shared access is read-only through `as_ptr`/`as_slice`.
+// SAFETY: shared access exposes metadata and a raw pointer, not references
+// into memory that a buffer pool may be mutating.
 unsafe impl Sync for Arena {}
 
 impl Arena {
@@ -168,17 +169,6 @@ impl Arena {
     pub fn as_ptr(&self) -> *mut u8 {
         self.ptr.as_ptr()
     }
-
-    /// Views the whole arena as bytes.
-    ///
-    /// Only valid while no [`BufferPool`](crate::pool::BufferPool) has handed
-    /// out mutable slices into it; the pool never calls this.
-    #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: the mapping is `len` bytes of zero-initialised (or since
-        // written) memory owned by `self`.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-    }
 }
 
 impl Drop for Arena {
@@ -206,7 +196,9 @@ mod tests {
         let arena = Arena::new(3 * PAGE_SIZE as usize + 1, HugePages::Disabled).unwrap();
         assert_eq!(arena.len(), 4 * PAGE_SIZE as usize);
         assert_eq!(arena.as_ptr() as usize % PAGE_SIZE as usize, 0);
-        assert!(arena.as_slice().iter().all(|&b| b == 0));
+        // SAFETY: this arena has not been given to a pool or mutated.
+        let bytes = unsafe { std::slice::from_raw_parts(arena.as_ptr(), arena.len()) };
+        assert!(bytes.iter().all(|&b| b == 0));
         assert_eq!(arena.backing(), Backing::Plain);
     }
 

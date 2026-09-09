@@ -23,8 +23,8 @@
 //! Sizes are rounded up to a power of two between one page and the configured
 //! maximum and served by a binary buddy allocator per arena, so a burst of
 //! large requests followed by small ones (or the reverse) never strands memory
-//! in the wrong size class. The allocator keeps its free lists inside the free
-//! blocks themselves, so allocation never touches the heap. Buffers are handed
+//! in the wrong size class. Preallocated per-order stacks recycle recent frees;
+//! intrusive links in free blocks support buddy coalescing. Buffers are handed
 //! out as [`PooledBuf`], an owning handle that returns the memory to the pool
 //! when dropped, so a buffer can be moved into an I/O queue and back without
 //! any lifetime bookkeeping.
@@ -117,8 +117,6 @@ struct Buddy {
     base: *mut u8,
     min_shift: u32,
     heads: Vec<usize>,
-    /// Blocks on each order's intrusive free list.
-    counts: Vec<usize>,
     /// Parked blocks per order: free, but not on the intrusive list and not
     /// marked in the bitmap.
     parked: Vec<Vec<usize>>,
@@ -143,7 +141,6 @@ impl Buddy {
             base: arena.as_ptr(),
             min_shift,
             heads: vec![NONE; orders],
-            counts: vec![0; orders],
             parked: (0..orders)
                 .map(|k| Vec::with_capacity((LAZY_BYTES_PER_ORDER >> (k as u32 + min_shift)).max(1)))
                 .collect(),
@@ -208,7 +205,6 @@ impl Buddy {
             self.set_links(head, offset, next);
         }
         self.heads[order] = offset;
-        self.counts[order] += 1;
         let (word, mask) = self.bit(order, offset);
         self.bitmaps[order][word] |= mask;
     }
@@ -225,7 +221,6 @@ impl Buddy {
             let [_, nn] = self.get_links(next);
             self.set_links(next, prev, nn);
         }
-        self.counts[order] -= 1;
         let (word, mask) = self.bit(order, offset);
         self.bitmaps[order][word] &= !mask;
     }
@@ -412,10 +407,10 @@ impl BufferPool {
     ///
     /// If called from a thread other than the one that created the pool.
     pub fn alloc(self: &Arc<Self>, len: usize) -> Option<PooledBuf> {
-        let size = self.class_size(len);
-        if size > self.max_class() {
+        if len > self.max_class() {
             return None;
         }
+        let size = self.class_size(len);
         let order = self.order(size);
         let (arena, offset) = self.with_buddies(|buddies| {
             self.drain_returned(buddies);
@@ -632,6 +627,7 @@ mod tests {
         let pool = pool(64 << 10, 64 << 10);
         let a = pool.alloc(64 << 10).unwrap();
         assert!(pool.alloc(4096).is_none());
+        assert!(pool.alloc(usize::MAX).is_none());
         drop(a);
         // The freed large block is split for the small request...
         let small = pool.alloc(4096).unwrap();

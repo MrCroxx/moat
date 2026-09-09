@@ -411,17 +411,12 @@ pub struct Index {
     current: std::sync::atomic::AtomicPtr<Table>,
     epochs: Box<[Epoch]>,
     live: AtomicUsize,
+    /// Read without dereferencing a table that the writer may retire.
+    capacity: AtomicUsize,
     tombstones: AtomicUsize,
     /// Maximum table bytes; growth beyond it reports the table full.
     budget: usize,
 }
-
-// SAFETY: the table pointer is only replaced by the single writer, which
-// retires the old table through the epoch protocol; readers only perform
-// atomic loads.
-unsafe impl Send for Index {}
-// SAFETY: as above.
-unsafe impl Sync for Index {}
 
 impl Index {
     /// Creates an empty index with room for `capacity` slots (rounded up to a
@@ -429,6 +424,7 @@ impl Index {
     pub fn new(capacity: usize, budget: usize) -> Self {
         let table = Box::new(Table::new(capacity));
         Self {
+            capacity: AtomicUsize::new(table.capacity()),
             current: std::sync::atomic::AtomicPtr::new(Box::into_raw(table)),
             epochs: (0..MAX_READERS).map(|_| Epoch(AtomicU64::new(0))).collect(),
             live: AtomicUsize::new(0),
@@ -493,25 +489,37 @@ impl Index {
     ///
     /// The caller must unpin the segment once it has finished reading.
     pub fn get_and_pin(&self, slot: &ReaderSlot, id: &ChunkId, segments: &SegmentTable) -> Option<IndexValue> {
-        let table = self.enter(slot);
+        let mut table = self.enter(slot);
         let result = loop {
             let Some((i, seq, value)) = table.find(id) else {
                 break None;
             };
-            segments.pin(value.loc.seg_no);
-            // Pin before re-reading the sequence number; reclaim removes the
-            // entry before it looks at the pin count.
-            fence(Ordering::SeqCst);
-            if table.slots[i].seq.load(Ordering::Relaxed) == seq {
-                if value.flags & FLAG_ACCESSED == 0 {
-                    table.slots[i].flags.fetch_or(FLAG_ACCESSED, Ordering::Relaxed);
-                }
+            if self.try_pin(table, i, seq, value, segments) {
                 break Some(value);
             }
-            segments.unpin(value.loc.seg_no);
+            table = self.table();
         };
         self.exit(slot);
         result
+    }
+
+    /// Validates both the table and the slot after pinning. A retired table
+    /// no longer observes removals made by reclaim in its replacement.
+    fn try_pin(&self, table: &Table, i: usize, seq: u32, value: IndexValue, segments: &SegmentTable) -> bool {
+        segments.pin(value.loc.seg_no);
+        // Reclaim removes entries before checking pins; rebuild publishes the
+        // replacement before reclaim can remove entries from it.
+        fence(Ordering::SeqCst);
+        if std::ptr::eq(table, self.current.load(Ordering::Acquire))
+            && table.slots[i].seq.load(Ordering::Relaxed) == seq
+        {
+            if value.flags & FLAG_ACCESSED == 0 {
+                table.slots[i].flags.fetch_or(FLAG_ACCESSED, Ordering::Relaxed);
+            }
+            return true;
+        }
+        segments.unpin(value.loc.seg_no);
+        false
     }
 
     /// Looks a chunk up from a thread without a registered slot (management
@@ -530,7 +538,7 @@ impl Index {
 
     /// Number of slots in the current table.
     pub fn capacity(&self) -> usize {
-        self.table().capacity()
+        self.capacity.load(Ordering::Relaxed)
     }
 
     /// Bytes the current table occupies.
@@ -755,6 +763,7 @@ impl IndexWriter {
             }
         }
         self.index.tombstones.store(0, Ordering::Relaxed);
+        self.index.capacity.store(new.capacity(), Ordering::Relaxed);
         let old_ptr = self.index.current.swap(Box::into_raw(new), Ordering::AcqRel);
         // Readers store an odd epoch, fence, then load the table pointer.
         // After this fence, any reader we observe outside a lookup will load
@@ -837,6 +846,45 @@ mod tests {
             flags: 0,
             lsn,
         }
+    }
+
+    #[test]
+    fn a_retired_table_cannot_pin_an_entry_removed_after_rebuild() {
+        let index = Arc::new(Index::new(16, usize::MAX));
+        let mut writer = IndexWriter::new(index.clone());
+        let key = ChunkId::from_u128(1);
+        writer.insert_if_newer(key, value(0, 4096, 1));
+        let slot = index.register().unwrap();
+        let table = index.enter(&slot);
+        let (i, seq, value) = table.find(&key).unwrap();
+        writer.rebuild(32);
+        writer.remove(&key).unwrap();
+        let segments = SegmentTable::new(1);
+        assert!(!index.try_pin(table, i, seq, value, &segments));
+        assert_eq!(segments.pins(0), 0);
+        index.exit(&slot);
+        assert_eq!(index.get_and_pin(&slot, &key, &segments), None);
+        index.unregister(slot);
+        writer.gc();
+        assert_eq!(writer.retired(), 0);
+    }
+
+    #[test]
+    fn capacity_is_safe_to_read_during_rebuild_and_retirement() {
+        let index = Arc::new(Index::new(16, usize::MAX));
+        let mut writer = IndexWriter::new(index.clone());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..10_000 {
+                    assert!(matches!(index.capacity(), 16 | 32));
+                    assert!(matches!(index.table_bytes(), 1024 | 2048));
+                }
+            });
+            for _ in 0..1_000 {
+                writer.rebuild(32);
+                writer.rebuild(16);
+            }
+        });
     }
 
     #[test]

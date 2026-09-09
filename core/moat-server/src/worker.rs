@@ -355,8 +355,11 @@ fn run_worker<H: Handler>(
             if step == Step::Stop || stop.load(Ordering::Acquire) {
                 break;
             }
-            idle = step == Step::Idle && cx.queue.in_flight() == 0;
-            if idle && let PollMode::Adaptive { idle_sleep } = opts.poll_mode {
+            idle = step == Step::Idle;
+            if idle
+                && cx.queue.in_flight() == 0
+                && let PollMode::Adaptive { idle_sleep } = opts.poll_mode
+            {
                 thread::sleep(idle_sleep);
             }
         }

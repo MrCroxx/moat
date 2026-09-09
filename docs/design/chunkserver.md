@@ -205,7 +205,7 @@ struct Entry {                 // 48 B
 ```
 
 - Memory ≈ 48 B / (7/8 load) ≈ 55 B per entry. 4 MiB average → 24 disks × 8 million ≈ 11 GB; 64 KiB average → ~170 GB. The extra 8 B over a minimal entry buy single-page reads for page-sized values (see §4.2). The engine enforces an `index_memory_budget`; beyond it PUT returns `NoSpace(index)`. **Deployments dominated by tiny objects must raise the budget or pack at the client.** This is a documented capacity constraint, not a hidden OOM.
-- **Reader pin protocol**: a GET reads the entry, increments the target segment's `pin_count` (atomic), then re-reads the entry's sequence number; if it changed, the reader unpins and retries. Reclaim removes or rewrites entries first and only then waits for `pin_count == 0`, so a reader whose pin is visible to reclaim also saw the entry before removal. A reader therefore never observes a reused segment (the post-read verification remains as a second line of defence).
+- **Reader pin protocol**: a GET reads the entry, increments the target segment's `pin_count` (atomic), then rechecks the current table pointer and the entry's sequence number; if either changed, the reader unpins and retries against the current table. Reclaim removes or rewrites entries first and only then waits for `pin_count == 0`, so a reader whose pin is visible to reclaim also saw the entry before removal. A reader therefore never observes a reused segment (optional post-read verification also checks data integrity).
 
 ### 4.5 Delete, GC and eviction
 

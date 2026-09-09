@@ -463,10 +463,19 @@ to it.
   table) and lost `force_sync` (the caller picks `UringQueue` or `SyncQueue`).
   `attach` checks the pool for a maximal large batch and a staging batch
   only; the reclaim window shrinks to the pool's largest class if it has to.
-- **`Descriptor` completions for a detached descriptor** are dropped by the
-  queue; `Writer::detach` and `Reader::detach` are the only way to release
-  a slot, and dropping a `Writer` without detaching leaks its slot until the
-  queue goes away (the engine's `writer_taken` flag is cleared either way).
+- **Descriptor lifetime** extends through every accepted I/O, including staged
+  submissions. Detaching closes the inbox and discards completions, but the
+  slot and fixed-file binding remain reserved until outstanding I/O is reaped.
+  Dropping a pipeline without detaching leaves its descriptor allocated until
+  the queue goes away. Dropping a reader releases all its segment pins,
+  including those for reads waiting for queue room.
+- **Index pinning** revalidates both the table pointer and the entry sequence
+  after taking a segment pin, so a lookup in a retired table cannot bypass
+  reclaim. Capacity reporting uses atomic metadata without dereferencing a
+  potentially retired table.
+- **Auxiliary I/O** checks the transferred length, including segment headers
+  and reclaim reads. A short reclaim read aborts the pass without freeing its
+  source segment.
 - **io_uring setup** uses `SINGLE_ISSUER` + `DEFER_TASKRUN` when the kernel
   accepts them (completion work runs only inside our own `io_uring_enter`,
   so a non-waiting `poll` enters with `GETEVENTS`), falling back to a plain

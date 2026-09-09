@@ -70,7 +70,7 @@ pub const SEGMENT_HEADER_LEN: u64 = PAGE_SIZE;
 pub const BATCH_HEADER_LEN: usize = 64;
 /// Encoded length of a [`RecordHeader`], excluding the block checksums.
 pub const RECORD_HEADER_LEN: usize = 64;
-/// Encoded length of a [`FooterHeader`].
+/// Encoded length of the footer header.
 pub const FOOTER_HEADER_LEN: usize = 64;
 /// Encoded length of a [`FooterEntry`].
 pub const FOOTER_ENTRY_LEN: usize = 48;
@@ -540,15 +540,6 @@ impl BlockChecksums<'_> {
 // ---------------------------------------------------------------------------
 // Footer
 // ---------------------------------------------------------------------------
-
-/// Header of a sealed segment's footer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FooterHeader {
-    /// Sequence number of the segment incarnation.
-    pub seg_seq: u64,
-    /// Number of [`FooterEntry`] that follow.
-    pub entry_count: u32,
-}
 
 /// One record of a sealed segment, as listed in its footer. Carries exactly
 /// what the index needs, so recovery rebuilds the index without reading data.

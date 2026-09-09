@@ -58,8 +58,8 @@ pub struct Node {
 }
 
 impl Node {
-    /// Opens every device, all in parallel. `numa` gives each disk's NUMA
-    /// node when known; it only informs owner assignment.
+    /// Opens every device in parallel. Use [`Self::assign_owners`] to assign
+    /// disks to workers after recovery.
     pub fn open(devices: Vec<Arc<dyn Device>>, options: Options) -> Result<Self, NodeError> {
         if devices.is_empty() {
             return Err(NodeError::NoDisks);
@@ -71,17 +71,22 @@ impl Node {
                 thread::spawn(move || moat_engine::open(device, options))
             })
             .collect();
-        let mut engines = Vec::new();
-        let mut reports = Vec::new();
-        for (disk, h) in handles.into_iter().enumerate() {
-            let (engine, report) = h
-                .join()
-                .unwrap_or_else(|_| {
+        // Join every recovery thread before propagating an error: no disk
+        // should still be recovering after `open` has returned to its caller.
+        let recovered: Vec<_> = handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
                     Err(moat_engine::Error::Io(std::io::Error::other(
                         "recovery thread panicked",
                     )))
                 })
-                .map_err(|source| NodeError::Open { disk, source })?;
+            })
+            .collect();
+        let mut engines = Vec::new();
+        let mut reports = Vec::new();
+        for (disk, result) in recovered.into_iter().enumerate() {
+            let (engine, report) = result.map_err(|source| NodeError::Open { disk, source })?;
             engines.push(engine);
             reports.push(report);
         }
@@ -193,6 +198,31 @@ impl std::fmt::Debug for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_error_does_not_leave_other_devices_open() {
+        let bad = Arc::new(moat_engine::MemDevice::new(4 << 20));
+        let good = Arc::new(moat_engine::MemDevice::new(4 << 20));
+        moat_engine::format(
+            &*good,
+            &moat_engine::FormatOptions {
+                segment_size: 1 << 20,
+                chunk_max: 64 << 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let result = Node::open(
+            vec![bad.clone(), good.clone()],
+            Options {
+                index_capacity: 64,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(result, Err(NodeError::Open { disk: 0, .. })));
+        assert_eq!(Arc::strong_count(&bad), 1);
+        assert_eq!(Arc::strong_count(&good), 1);
+    }
 
     #[test]
     fn owner_assignment_prefers_numa_and_balances() {

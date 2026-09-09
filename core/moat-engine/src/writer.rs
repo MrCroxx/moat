@@ -282,12 +282,7 @@ enum Apply {
 }
 
 struct PendingRecord {
-    /// Offset of the record header from the start of the batch.
-    offset_in_batch: u32,
-    /// Offset of the value from the start of the batch.
-    value_in_batch: u32,
-    /// Footer entry with segment-relative offsets left at zero until the batch
-    /// position is known.
+    /// Offsets are batch-relative until `enqueue_batch` fixes the position.
     entry: FooterEntry,
     apply: Apply,
     ticket: Option<Ticket>,
@@ -395,9 +390,7 @@ impl Pending {
             self.header_pos = hdr_pos + meta;
         }
         self.records.push(PendingRecord {
-            offset_in_batch: hdr_pos as u32,
-            value_in_batch: value_pos as u32,
-            entry: footer_entry(hdr, checksums),
+            entry: footer_entry(hdr, checksums, hdr_pos, value_pos),
             apply,
             ticket,
         });
@@ -430,11 +423,11 @@ impl Pending {
 }
 
 /// The footer entry for a record, with segment offsets still unresolved.
-fn footer_entry(hdr: &RecordHeader, checksums: &[u32]) -> FooterEntry {
+fn footer_entry(hdr: &RecordHeader, checksums: &[u32], offset: usize, value_off: usize) -> FooterEntry {
     FooterEntry {
         key: hdr.key,
-        offset: 0,
-        value_off: 0,
+        offset: offset as u32,
+        value_off: value_off as u32,
         value_len: hdr.value_len,
         lsn: hdr.lsn,
         crc: checksums.first().copied().unwrap_or(0),
@@ -602,7 +595,7 @@ pub struct Writer {
     /// Closed batches waiting for queue room, per segment kind.
     ready: [VecDeque<Batch>; 2],
     inflight: VecDeque<InFlight>,
-    aux: HashMap<u64, Aux>,
+    aux: HashMap<u64, (Aux, usize)>,
     aux_ready: VecDeque<AuxOp>,
     sealing: Vec<Sealing>,
     barriers: VecDeque<Barrier>,
@@ -793,13 +786,7 @@ impl Writer {
     /// batch, so the value can be produced in place and written without a
     /// copy. `value_len` must be at least the pack threshold.
     pub fn prepare_large(&mut self, q: &mut dyn IoQueue, value_len: u32) -> Result<LargeValue> {
-        let max = self.shared.superblock.chunk_max;
-        if value_len > max {
-            return Err(Error::ValueTooLarge {
-                len: value_len as u64,
-                max: max as u64,
-            });
-        }
+        self.check_len(value_len as u64)?;
         if value_len < self.shared.options.pack_threshold {
             return Err(Error::InvalidOption(format!(
                 "large values must be at least {} bytes",
@@ -902,20 +889,7 @@ impl Writer {
     /// the first error among those writes.
     pub fn flush(&mut self, q: &mut dyn IoQueue) -> Result<Ticket> {
         self.close_all_pending(q)?;
-        let ticket = self.next_ticket();
-        self.barriers.push_back(Barrier {
-            ticket,
-            until: self.next_batch_id,
-            seal: None,
-            fsync: if self.shared.options.sync_on_flush {
-                Fsync::Pending
-            } else {
-                Fsync::NotNeeded
-            },
-            error: None,
-        });
-        self.push_ready(q);
-        Ok(ticket)
+        Ok(self.enqueue_barrier(q, None))
     }
 
     /// `flush`, then seal both active segments so the next open needs no
@@ -934,11 +908,15 @@ impl Writer {
                 self.park(active);
             }
         }
+        Ok(self.enqueue_barrier(q, Some(sealed)))
+    }
+
+    fn enqueue_barrier(&mut self, q: &mut dyn IoQueue, seal: Option<Vec<u32>>) -> Ticket {
         let ticket = self.next_ticket();
         self.barriers.push_back(Barrier {
             ticket,
             until: self.next_batch_id,
-            seal: Some(sealed),
+            seal,
             fsync: if self.shared.options.sync_on_flush {
                 Fsync::Pending
             } else {
@@ -947,7 +925,7 @@ impl Writer {
             error: None,
         });
         self.push_ready(q);
-        Ok(ticket)
+        ticket
     }
 
     /// Starts one reclaim pass under `policy`; the completion reports
@@ -1022,8 +1000,8 @@ impl Writer {
         let mut finished = std::mem::take(&mut self.scratch);
         for done in finished.drain(..) {
             if done.token & AUX_TOKEN != 0 {
-                if let Some(aux) = self.aux.remove(&done.token) {
-                    self.finish_aux(aux, done);
+                if let Some((aux, len)) = self.aux.remove(&done.token) {
+                    self.finish_aux(aux, len, done);
                 }
             } else if let Some(front) = self.inflight.front() {
                 let index = (done.token - front.token) as usize;
@@ -1267,9 +1245,7 @@ impl Writer {
         .encode(&mut buf[..BATCH_HEADER_LEN]);
         self.track(hdr, apply);
         let record = PendingRecord {
-            offset_in_batch: BATCH_HEADER_LEN as u32,
-            value_in_batch: value_off as u32,
-            entry: footer_entry(hdr, checksums),
+            entry: footer_entry(hdr, checksums, BATCH_HEADER_LEN, value_off),
             apply,
             ticket,
         };
@@ -1316,9 +1292,20 @@ impl Writer {
 
     /// Fixes a fully encoded batch at the tail of `seg_no` and appends it to
     /// the ready queue of kind `k`.
-    fn enqueue_batch(&mut self, k: usize, seg_no: u32, buf: PooledBuf, batch_len: usize, records: Vec<PendingRecord>) {
+    fn enqueue_batch(
+        &mut self,
+        k: usize,
+        seg_no: u32,
+        buf: PooledBuf,
+        batch_len: usize,
+        mut records: Vec<PendingRecord>,
+    ) {
         let seg = self.segment_mut(seg_no).expect("segment exists");
         let offset = seg.tail;
+        for rec in &mut records {
+            rec.entry.offset += offset as u32;
+            rec.entry.value_off += offset as u32;
+        }
         seg.tail += batch_len as u64;
         seg.unapplied += 1;
         seg.unapplied_records += records.len();
@@ -1404,20 +1391,12 @@ impl Writer {
             seg.broken
         };
         if failure.is_none() && !broken {
-            let entries: Vec<FooterEntry> = batch
-                .records
-                .iter()
-                .map(|rec| FooterEntry {
-                    offset: (batch.offset + rec.offset_in_batch as u64) as u32,
-                    value_off: (batch.offset + rec.value_in_batch as u64) as u32,
-                    ..rec.entry
-                })
-                .collect();
             self.segment_mut(seg_no)
                 .expect("segment outlives its batches")
                 .footer
-                .extend_from_slice(&entries);
-            for (rec, entry) in batch.records.into_iter().zip(entries) {
+                .extend(batch.records.iter().map(|rec| rec.entry));
+            for rec in batch.records {
+                let entry = rec.entry;
                 let result = self.apply_record(seg_no, &entry, rec.apply);
                 if let Some(ticket) = rec.ticket {
                     let outcome = match rec.apply {
@@ -1564,7 +1543,7 @@ impl Writer {
         };
         match outcome {
             Ok(()) => {
-                self.aux.insert(token, aux);
+                self.aux.insert(token, (aux, len));
                 None
             }
             Err(buf) => Some(AuxOp {
@@ -1595,7 +1574,12 @@ impl Writer {
         Ok(())
     }
 
-    fn finish_aux(&mut self, aux: Aux, done: IoCompletion) {
+    fn finish_aux(&mut self, aux: Aux, len: usize, mut done: IoCompletion) {
+        if let Ok(n) = done.result
+            && n != len
+        {
+            done.result = Err(io::Error::other(format!("short I/O: {n} of {len} bytes")));
+        }
         let failure = match &done.result {
             Ok(_) => None,
             Err(e) => Some(e.to_string()),
@@ -1857,7 +1841,7 @@ impl Writer {
                 let token = self.next_aux_token();
                 match q.fsync(self.desc, token) {
                     Ok(()) => {
-                        self.aux.insert(token, Aux::Fsync { ticket });
+                        self.aux.insert(token, (Aux::Fsync { ticket }, 0));
                         self.barriers[i].fsync = Fsync::Issued;
                     }
                     Err(_) => {
@@ -2190,6 +2174,75 @@ impl Drop for Writer {
 mod tests {
     use super::*;
     use crate::layout::prefer_framed;
+
+    #[test]
+    fn short_auxiliary_io_fails_without_reclaiming_live_data() {
+        use crate::{
+            FormatOptions, MemDevice, Options, QueueOptions, blocking,
+            io::{CompletionOrder, SyncQueue},
+        };
+        use moat_common::{HugePages, PoolOptions};
+
+        for reclaim in [false, true] {
+            let device = Arc::new(MemDevice::new(5 << 20));
+            crate::format(
+                &*device,
+                &FormatOptions {
+                    segment_size: 1 << 20,
+                    chunk_max: 64 << 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let (engine, _) = crate::open(
+                device,
+                Options {
+                    index_capacity: 64,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut queue = SyncQueue::new(
+                &QueueOptions {
+                    pool: PoolOptions {
+                        bytes: 2 << 20,
+                        max_class: 1 << 20,
+                        huge_pages: HugePages::Disabled,
+                    },
+                    ..Default::default()
+                },
+                CompletionOrder::Fifo,
+            )
+            .unwrap();
+            let mut writer = engine.writer(&mut queue).unwrap();
+            let key = ChunkId::from_u128(1);
+            writer.put(&mut queue, key, b"value", PutOptions::default()).unwrap();
+            let ticket = if reclaim {
+                blocking::seal(&mut queue, &mut writer).unwrap();
+                writer.reclaim(&mut queue, ReclaimPolicy::Storage).unwrap().unwrap()
+            } else {
+                writer.flush(&mut queue).unwrap()
+            };
+            queue.poll(false).unwrap();
+            let mut done = Vec::new();
+            assert_eq!(queue.take(writer.desc, &mut done), 1);
+            let mut completion = done.pop().unwrap();
+            completion.result = Ok(0);
+            let (aux, len) = writer.aux.remove(&completion.token).unwrap();
+            writer.finish_aux(aux, len, completion);
+            assert!(blocking::wait(&mut queue, &mut writer, ticket).is_err());
+            if reclaim {
+                assert_eq!(engine.usage().sealed_segments, 1);
+                let mut reader = engine.reader(&mut queue).unwrap();
+                assert_eq!(
+                    &*blocking::get(&mut queue, &mut reader, &key, None).unwrap().unwrap(),
+                    b"value"
+                );
+            } else {
+                assert!(!engine.contains(&key));
+            }
+        }
+    }
 
     #[test]
     fn framing_decision_for_near_page_multiples() {

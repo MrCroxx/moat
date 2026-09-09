@@ -38,7 +38,6 @@ use std::{
         unix::fs::FileExt,
     },
     path::Path,
-    sync::Arc,
 };
 
 use moat_common::{PAGE_SIZE, is_aligned};
@@ -167,12 +166,6 @@ impl Device for FileDevice {
 // MemDevice
 // ---------------------------------------------------------------------------
 
-struct MemState {
-    data: RwLock<Vec<u8>>,
-    /// Writes overlapping this range fail with `EIO`.
-    fail_writes: Mutex<Option<Range<u64>>>,
-}
-
 /// An in-memory device for tests.
 ///
 /// Besides the [`Device`] interface it exposes the raw bytes so tests can
@@ -181,7 +174,9 @@ struct MemState {
 /// It has no file descriptor, so it is driven through a
 /// [`SyncQueue`](crate::io::SyncQueue).
 pub struct MemDevice {
-    state: Arc<MemState>,
+    data: RwLock<Vec<u8>>,
+    /// Writes overlapping this range fail with `EIO`.
+    fail_writes: Mutex<Option<Range<u64>>>,
 }
 
 impl MemDevice {
@@ -189,30 +184,32 @@ impl MemDevice {
     pub fn new(len: u64) -> Self {
         assert!(is_aligned(len, PAGE_SIZE), "device length must be page aligned");
         Self {
-            state: Arc::new(MemState {
-                data: RwLock::new(vec![0; len as usize]),
-                fail_writes: Mutex::new(None),
-            }),
+            data: RwLock::new(vec![0; len as usize]),
+            fail_writes: Mutex::new(None),
         }
     }
 
     /// Runs `f` with mutable access to the raw device contents.
     pub fn with_data_mut<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
-        f(&mut self.state.data.write())
+        f(&mut self.data.write())
     }
 
     /// Runs `f` with read access to the raw device contents.
     pub fn with_data<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        f(&self.state.data.read())
+        f(&self.data.read())
     }
 
     /// Makes every write that overlaps `range` fail with `EIO` (`None` clears).
     pub fn fail_writes_in(&self, range: Option<Range<u64>>) {
-        *self.state.fail_writes.lock() = range;
+        *self.fail_writes.lock() = range;
     }
 }
 
-impl MemState {
+impl Device for MemDevice {
+    fn capacity(&self) -> u64 {
+        self.data.read().len() as u64
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
         let data = self.data.read();
         check_io(buf.len(), offset, data.len() as u64)?;
@@ -233,20 +230,6 @@ impl MemState {
         let start = offset as usize;
         data[start..start + buf.len()].copy_from_slice(buf);
         Ok(())
-    }
-}
-
-impl Device for MemDevice {
-    fn capacity(&self) -> u64 {
-        self.state.data.read().len() as u64
-    }
-
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        self.state.read_at(buf, offset)
-    }
-
-    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        self.state.write_at(buf, offset)
     }
 
     fn sync(&self) -> io::Result<()> {

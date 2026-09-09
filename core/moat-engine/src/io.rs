@@ -100,7 +100,8 @@ pub trait IoQueue: Send {
     fn attach(&mut self, device: &Arc<dyn Device>) -> io::Result<Descriptor>;
 
     /// Closes a descriptor. Completions still in flight for it are discarded
-    /// on arrival (their buffers return to the pool).
+    /// on arrival (their buffers return to the pool). The slot stays reserved
+    /// until all accepted operations have been reaped.
     fn detach(&mut self, desc: Descriptor);
 
     /// Enqueues a read of `len` bytes at `offset` into the start of `buf`.
@@ -146,44 +147,61 @@ pub trait IoQueue: Send {
 /// Completion inboxes indexed by descriptor, shared by both queue
 /// implementations.
 pub(crate) struct Inboxes {
-    boxes: Vec<Option<Vec<IoCompletion>>>,
+    boxes: Vec<Inbox>,
+}
+
+#[derive(Default)]
+struct Inbox {
+    open: bool,
+    pending: usize,
+    done: Vec<IoCompletion>,
 }
 
 impl Inboxes {
     pub(crate) fn new(capacity: u32) -> Self {
         Self {
-            boxes: (0..capacity.max(1)).map(|_| None).collect(),
+            boxes: (0..capacity.max(1)).map(|_| Inbox::default()).collect(),
         }
     }
 
     /// Opens the lowest free inbox.
     pub(crate) fn open(&mut self) -> Option<Descriptor> {
-        let slot = self.boxes.iter().position(Option::is_none)?;
-        self.boxes[slot] = Some(Vec::new());
+        let slot = self.boxes.iter().position(|b| !b.open && b.pending == 0)?;
+        self.boxes[slot].open = true;
         Some(Descriptor(slot as u32))
     }
 
-    pub(crate) fn close(&mut self, desc: Descriptor) {
-        if let Some(b) = self.boxes.get_mut(desc.0 as usize) {
-            *b = None;
-        }
+    /// Closes the inbox; returns whether its file slot can be released now.
+    pub(crate) fn close(&mut self, desc: Descriptor) -> bool {
+        let Some(b) = self.boxes.get_mut(desc.0 as usize).filter(|b| b.open) else {
+            return false;
+        };
+        b.open = false;
+        b.done.clear();
+        b.pending == 0
     }
 
-    pub(crate) fn is_open(&self, desc: Descriptor) -> bool {
-        self.boxes.get(desc.0 as usize).is_some_and(Option::is_some)
+    pub(crate) fn start(&mut self, desc: Descriptor) {
+        let b = &mut self.boxes[desc.0 as usize];
+        assert!(b.open, "operation on a detached descriptor");
+        b.pending += 1;
     }
 
-    /// Delivers a completion; completions for closed descriptors are dropped.
-    pub(crate) fn deliver(&mut self, desc: Descriptor, done: IoCompletion) {
-        if let Some(Some(inbox)) = self.boxes.get_mut(desc.0 as usize) {
-            inbox.push(done);
+    /// Returns whether the last operation of a closed descriptor was reaped.
+    pub(crate) fn deliver(&mut self, desc: Descriptor, done: IoCompletion) -> bool {
+        let b = &mut self.boxes[desc.0 as usize];
+        b.pending -= 1;
+        if b.open {
+            b.done.push(done);
         }
+        !b.open && b.pending == 0
     }
 
     pub(crate) fn take(&mut self, desc: Descriptor, out: &mut Vec<IoCompletion>) -> usize {
-        let Some(Some(inbox)) = self.boxes.get_mut(desc.0 as usize) else {
+        let Some(b) = self.boxes.get_mut(desc.0 as usize).filter(|b| b.open) else {
             return 0;
         };
+        let inbox = &mut b.done;
         let n = inbox.len();
         if n == 0 {
             return 0;
@@ -276,6 +294,7 @@ impl IoQueue for SyncQueue {
             return Err(buf);
         }
         let result = self.device(desc).read_at(&mut buf[..len], offset).map(|()| len);
+        self.inboxes.start(desc);
         self.done.push((
             desc,
             IoCompletion {
@@ -299,6 +318,7 @@ impl IoQueue for SyncQueue {
             return Err(buf);
         }
         let result = self.device(desc).write_at(&buf[..len], offset).map(|()| len);
+        self.inboxes.start(desc);
         self.done.push((
             desc,
             IoCompletion {
@@ -315,6 +335,7 @@ impl IoQueue for SyncQueue {
             return Err(Full);
         }
         let result = self.device(desc).sync().map(|()| 0);
+        self.inboxes.start(desc);
         self.done.push((
             desc,
             IoCompletion {
@@ -332,10 +353,11 @@ impl IoQueue for SyncQueue {
 
     fn poll(&mut self, _wait: bool) -> io::Result<usize> {
         let n = self.done.len();
-        let done = std::mem::take(&mut self.done);
-        match self.order {
-            CompletionOrder::Fifo => done.into_iter().for_each(|(d, c)| self.inboxes.deliver(d, c)),
-            CompletionOrder::Reverse => done.into_iter().rev().for_each(|(d, c)| self.inboxes.deliver(d, c)),
+        if self.order == CompletionOrder::Reverse {
+            self.done.reverse();
+        }
+        for (desc, done) in self.done.drain(..) {
+            self.inboxes.deliver(desc, done);
         }
         Ok(n)
     }
@@ -350,5 +372,71 @@ impl IoQueue for SyncQueue {
 
     fn depth(&self) -> usize {
         self.depth
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use moat_common::HugePages;
+
+    use super::*;
+    use crate::device::MemDevice;
+
+    pub(crate) fn check_detach(q: &mut dyn IoQueue, a: Arc<dyn Device>, b: Arc<dyn Device>) {
+        let old = q.attach(&a).unwrap();
+        let mut buf = q.pool().alloc(4096).unwrap();
+        buf[..4096].fill(1);
+        q.write(old, buf, 4096, 0, 1).unwrap();
+        // Detach before submit: the fixed-file binding must survive staging.
+        q.detach(old);
+        let new = q.attach(&b).unwrap();
+        assert_ne!(old, new, "an outstanding operation still owns the old slot");
+        assert!(q.attach(&a).is_err(), "both descriptor slots are reserved");
+        let mut buf = q.pool().alloc(4096).unwrap();
+        buf[..4096].fill(2);
+        q.write(new, buf, 4096, 0, 2).unwrap();
+        while q.in_flight() > 0 {
+            q.poll(true).unwrap();
+        }
+        let mut done = Vec::new();
+        assert_eq!(q.take(old, &mut done), 0);
+        assert_eq!(q.take(new, &mut done), 1);
+        let completion = done.pop().unwrap();
+        assert_eq!(completion.token, 2);
+        assert_eq!(completion.result.unwrap(), 4096);
+        drop(completion.buf);
+        let mut bytes = [0; 4096];
+        a.read_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [1; 4096]);
+        b.read_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [2; 4096]);
+        assert_eq!(q.attach(&a).unwrap(), old, "completed slots can be reused");
+        q.detach(old);
+        q.detach(new);
+        assert_eq!(q.pool().in_use(), 0);
+    }
+
+    pub(crate) fn detach_options() -> QueueOptions {
+        QueueOptions {
+            depth: 4,
+            descriptors: 2,
+            pool: PoolOptions {
+                bytes: 1 << 20,
+                max_class: 64 << 10,
+                huge_pages: HugePages::Disabled,
+            },
+        }
+    }
+
+    #[test]
+    fn detached_descriptors_wait_for_outstanding_completions() {
+        for order in [CompletionOrder::Fifo, CompletionOrder::Reverse] {
+            let mut queue = SyncQueue::new(&detach_options(), order).unwrap();
+            check_detach(
+                &mut queue,
+                Arc::new(MemDevice::new(4096)),
+                Arc::new(MemDevice::new(4096)),
+            );
+        }
     }
 }
