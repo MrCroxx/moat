@@ -20,7 +20,7 @@
 | Who handles variable length | **Two layers**: anything up to `CHUNK_MAX` is handled natively and efficiently by the chunkserver (bytes to megabytes, no upper-layer packing); anything larger is split by the **client library** into chunks written in parallel across all disks and nodes |
 | Per-disk engine | **One independent log-structured engine per disk**: fixed-size segments (default 1 GiB) + append-only records + footer index per sealed segment + in-memory hash index + segment-granular reclaim |
 | Metadata persistence | **No RocksDB, no separate WAL.** The log is the WAL. Recovery = read every segment header + footers of sealed segments + forward scan of at most two active segments |
-| Reclaim | **GC and cache eviction are one code path**: pick a segment → decide per record whether to relocate or drop → free the segment. Storage mode uses greedy + age rules; cache mode uses FIFO + reinsertion by access bit |
+| Reclaim | **Storage GC only**: choose a sealed segment with the fewest live bytes, relocate live records, discard obsolete records, then free the segment. Valid chunks are never evicted |
 | Disk placement | **Deterministic**: weighted rendezvous hashing of `ChunkId` over disks (weight = capacity). Engines are fully independent; adding, removing or losing a disk affects nothing else |
 | Threads | One kind of pinned, busy-polling **worker** (private RDMA reactor + io_uring + arena), with a configurable count bounded by the CPU budget. Every worker reads every disk directly; each disk has exactly one **owner worker** that is also its writer (sole owner of the log tail, index mutations and reclaim). Clients route PUTs to the owner, so the hot path has no cross-thread hop; a forwarding ring between workers is the cold fallback. tokio for the management plane only |
 | RDMA data path | RC QPs, inline SEND control messages. **PUT = server-grant / client-push**; **GET = client RDMA READ pull**; values ≤ `INLINE_MAX` (default 4 KiB) travel inline in one round trip |
@@ -44,7 +44,7 @@
 ### 1.2 Assumptions added by this document
 
 - **Hardware baseline**: PCIe 5 NVMe (~10 GB/s sequential read, ~5–7 GB/s write per disk), 4–8 × 400 Gb/s RDMA NICs (~46 GB/s usable each), 96+ cores, multiple NUMA nodes. 24 disks aggregate to 150–200 GB/s, matching four 400G NICs.
-- **Semantic baseline**: the chunkserver is a **single-node, durable, correct** chunk store. Once a PUT is acknowledged it must be readable after a restart unless the disk fails; the engine must **never return wrong data** (it returns MISS or CORRUPT instead). Cache eviction is a **policy switch** on top of the engine, not a second engine.
+- **Semantic baseline**: the chunkserver is a **single-node, durable, correct** chunk store. Once a PUT is acknowledged it must be readable after a restart unless the disk fails; the engine must **never return wrong data** (it returns MISS or CORRUPT instead). Valid chunks remain stored until explicitly deleted or overwritten; storage pressure never authorizes eviction.
 - **Enterprise drives have power-loss protection**; by default no flush is issued on the data path. A `sync_mode` option exists for drives without it.
 - **Replication is not inside the chunkserver**: replicas, erasure coding or chain replication are built above it (client-side multi-write or a separate replication layer). The engine exposes `lsn` and `if_absent` primitives so that layer can replay idempotently (see §11).
 
@@ -198,7 +198,7 @@ struct Entry {                 // 48 B
     key: ChunkId,              // 16 B
     seg_no: u32, offset: u32,  // location of the record header
     value_off: u32,            // location of the value (differs from the header for framed records)
-    value_len: u32, flags: u32,// LARGE, FRAMED, ACCESSED
+    value_len: u32, flags: u32,// LARGE, FRAMED
     crc: u32,                  // CRC32C of the first checksum block: verifies framed reads without the header
     lsn: u64,                  // recovery ordering + external version token
 }
@@ -207,7 +207,7 @@ struct Entry {                 // 48 B
 - Memory ≈ 48 B / (7/8 load) ≈ 55 B per entry. 4 MiB average → 24 disks × 8 million ≈ 11 GB; 64 KiB average → ~170 GB. The extra 8 B over a minimal entry buy single-page reads for page-sized values (see §4.2). The engine enforces an `index_memory_budget`; beyond it PUT returns `NoSpace(index)`. **Deployments dominated by tiny objects must raise the budget or pack at the client.** This is a documented capacity constraint, not a hidden OOM.
 - **Reader pin protocol**: a GET reads the entry, increments the target segment's `pin_count` (atomic), then rechecks the current table pointer and the entry's sequence number; if either changed, the reader unpins and retries against the current table. Reclaim removes or rewrites entries first and only then waits for `pin_count == 0`, so a reader whose pin is visible to reclaim also saw the entry before removal. A reader therefore never observes a reused segment (optional post-read verification also checks data integrity).
 
-### 4.5 Delete, GC and eviction
+### 4.5 Delete and GC
 
 **Delete** is a variant of the write path and runs on the disk's owner worker (routed like a PUT, §6.3):
 
@@ -218,11 +218,11 @@ struct Entry {                 // 48 B
 
 Data is not touched; space is reclaimed asynchronously. A worker mid-read has pinned the segment (§4.4) and is unaffected. `overwrite = true` needs no tombstone (the higher-lsn data record supersedes the old one).
 
-**GC runs on the owner worker as a state machine advanced by `Writer::poll`, in small steps interleaved with foreground work**, not on its own thread, so it is serialised with PUT/Del by construction and needs no CAS. The reclaim procedure is identical in storage and cache mode:
+**GC runs on the owner worker as a state machine advanced by `Writer::poll`, in small steps interleaved with foreground work**, not on its own thread, so it is serialised with PUT/Del by construction and needs no CAS. Reclaim preserves every live chunk:
 
 ```
 pick_victim() → sequential read of the whole segment (io_uring, rate limited) → per record:
-    Data      and index[key].loc == this record        → decide(record) ∈ {Relocate → Cold segment, Drop}
+    Data      and index[key].loc == this record        → Relocate to Cold segment; abort on corruption
     Data      and index points elsewhere / absent      → Drop (overwritten or deleted)
     Tombstone and index[key] is Live                   → Drop (a newer data version supersedes it)
     Tombstone and this is the oldest non-Free segment  → Drop (no older data can exist)
@@ -230,12 +230,7 @@ pick_victim() → sequential read of the whole segment (io_uring, rate limited) 
 → all relocations done and index repointed → wait pin_count == 0 → header state = Free
 ```
 
-`pick_victim` and `decide` are the only two policy points:
-
-| Mode | `pick_victim` | `decide` |
-|---|---|---|
-| Storage | Trigger: free segments < 10%. Greedy: lowest live ratio; plus a forced pick of the oldest segment when it exceeds an age threshold or total tombstone volume exceeds a threshold (bounds tombstone lifetime) | Live → Relocate |
-| Cache | Trigger: free segments below a low-water mark (with hysteresis). FIFO: oldest segment | `ACCESSED` bit set → Relocate to Cold and clear the bit (S3-FIFO / SIEVE style reinsertion, ratio cap configurable); otherwise Drop |
+`pick_victim()` chooses the sealed segment with the fewest live bytes, breaking ties by age. Callers explicitly start `Writer::reclaim(queue)` before free space is exhausted. Automatic watermarks, age-based scheduling and throttling are not implemented. With no free segment, writes report `NoSpace`; reclaim does not discard live chunks to make room.
 
 Reclaim mechanics:
 
@@ -243,7 +238,7 @@ Reclaim mechanics:
 - A relocated record **keeps its lsn** and goes into the Cold active segment. Reclaim is thereby a purely physical move: the set of `(key, lsn, kind, value)` records recovery sees is unchanged by it, the lsn a client observed for a chunk stays valid across compaction, and no ordering argument between reclaim and concurrent foreground writes is needed. **When the relocation's completion arrives, `index[key].loc` is compared with the old location in the victim**: if unchanged the entry is repointed; if a foreground PUT interleaved between the reclaim decision and the completion has overwritten the key, the entry is left alone and the copy is immediately dead data in the Cold segment (the PUT's lsn is higher, so recovery agrees).
 - After every record is processed, every relocation completed and no index entry points at the victim any more, wait for `pin_count == 0`, rewrite the header as `Free`, push the segment onto the free list.
 - Cost of reclaiming a 1 GiB segment ≈ read 1 GiB + write the live bytes + one index lookup per record (a segment full of 4 KiB records is 260k lookups, tens of milliseconds of CPU). At 1.5 GB/s the read takes ~0.7 s.
-- Write amplification: storage mode with greedy selection and hot/cold separation is typically 1.5–3× at 85–90% utilisation, which is why storage mode reports `NoSpace` around 90% instead of filling up; cache mode is `1 + reinsertion ratio`, capped at 1.2×.
+- Write amplification depends on the live fraction of each victim. Callers must reserve free space for relocation; the engine does not enforce a utilization watermark. Corrupt live values or malformed batches before the sealed data boundary abort reclaim without freeing the victim.
 - The read path is unaffected by GC (reads bypass the writer; segments are freed only after pins drain); GC writes share the writer pipeline but foreground PUTs go first.
 - **Hot/Cold active segments**: foreground writes go to Hot, relocations to Cold. Hot/cold separation markedly lowers write amplification (the classic LFS result) at the cost of scanning two active segments on recovery.
 
@@ -275,7 +270,7 @@ Cost: headers 120 MB + footers ≈ index volume (48 B × records; 8 million ≈ 
    - A low-priority thread per disk copies the hash table in 1 MiB slices (readers are never blocked; a slice whose entries changed underneath, detected through the per-slot sequence numbers, is re-copied), memcpy to staging, then `WriteFixed` into `kind = Index` segments. The writer is never stalled; p99 is untouched.
    - After all slices complete, superblock A/B flips to the new image (with `L0`, replay start positions, the segment table, table capacity, hasher seed, per-slice CRCs); the old image's segments are freed.
    - Recovery: read the image straight into table memory (zero hashing, 21 GB ≈ 2 s); scan the two active segments from the recorded positions and every segment with `seg_seq` above the checkpoint's maximum; replay only records with `lsn ≥ L0`, merging with the image by **highest lsn** (image entries carry their lsn); drop entries pointing at `Free` segments or at segments whose `seg_seq` differs from the checkpoint's table (can be done lazily on read).
-   - Correctness: every index change after T0 is either a record with `lsn ≥ L0` (inserts, overwrites, relocations — taking the *lowest in-flight* lsn is what keeps in-flight writes' late index updates inside the replay range; a delete's index removal and its tombstone lsn are assigned in the same job, so the tombstone has `lsn ≥ L0`), or has no record at all — only cache-mode Drop eviction (caught by the segment-table check; if the segment has not been reused the entry comes back as live, harmless for a cache). Slices are copied under the lock, so no torn entries.
+   - Correctness remains to be specified before implementing checkpoints: relocations preserve their original LSN, so a replay filter of `lsn ≥ L0` alone cannot recover physical moves. Replay must also account for relocated records and segment incarnation changes; index slices require seqlock validation. The current implementation rebuilds from segment headers, footers and active scans and does not use checkpoints.
    - Trigger: footer bytes written since the last checkpoint reach 10% of the image size (bounding replay to one tenth of a full rebuild), or a time limit, whichever first. At worst-case scale a checkpoint every 10 minutes is ~35 MB/s per disk (0.7% of write bandwidth, 0.1 DWPD); two images occupy 0.14% of the disk. At typical scale these are two orders of magnitude smaller.
    - The gain only shows when the index is very large (worst case 10–20 s → 3–4 s; typical scale barely changes), hence phase two. A clean-shutdown image is a special case (`L0` = next lsn, empty replay); the two share one mechanism.
 
@@ -302,8 +297,8 @@ Each disk recovers and comes online independently; a slow disk does not block th
 `disk_of(id) = argmax_d  H(id, disk_uuid_d) ^ (1 / weight_d)` (weighted rendezvous hashing, weight = capacity).
 
 - No central table, no state, O(disks); adding or removing a disk moves the minimum number of keys.
-- The node keeps a `layout_epoch` and `[current, previous]` disk sets: GET consults the current disk first and, on a miss, the previous one if different; a background migration moves keys from previous disks that now belong elsewhere, then drops the previous layout. Cache mode may disable migration (accept one round of 1/N misses). **During a transition `Del` must be delivered to both the current and the previous disk** (each acting on its own index); otherwise the key stays on the previous disk while the current one answers Miss without a tombstone, and the GET fallback resurrects it. Overwrites are unaffected (GET checks current first).
-- Why not "PUT picks the emptiest disk + a global index": deterministic placement makes the 24 engines fully independent (their own recovery, failures and GC) with no global index or cross-disk state. The price is that a slow disk slows 1/N of the keyspace; it is isolated through that disk's write window saturating → `Throttle` (in cache mode, "do not cache this batch of keys").
+- The node keeps a `layout_epoch` and `[current, previous]` disk sets: GET consults the current disk first and, on a miss, the previous one if different; a background migration moves keys from previous disks that now belong elsewhere, then drops the previous layout. **During a transition `Del` must be delivered to both the current and the previous disk** (each acting on its own index); otherwise the key stays on the previous disk while the current one answers Miss without a tombstone, and the GET fallback resurrects it. Overwrites are unaffected (GET checks current first).
+- Why not "PUT picks the emptiest disk + a global index": deterministic placement makes the 24 engines fully independent (their own recovery, failures and GC) with no global index or cross-disk state. The price is that a slow disk slows 1/N of the keyspace; it is isolated through that disk's write window saturating → `Throttle`.
 
 ### 5.3 Threads
 
@@ -412,10 +407,10 @@ Client                                        Server worker
 
 Read path essentials:
 
-- **The whole path stays on the worker that received the request; there is no cross-thread hand-off.** It touches three shared things, none of them a lock: a seqlock-protected index entry (memory only), the per-disk read-window atomic, and a segment pin counter (§4.4). Cache mode's `ACCESSED` bit is an atomic or on the entry's flags.
+- **The whole path stays on the worker that received the request; there is no cross-thread hand-off.** It touches three shared things, none of them a lock: a seqlock-protected index entry (memory only), the per-disk read-window atomic, and a segment pin counter (§4.4).
 - **I/O count.** The current reader submits one contiguous I/O per request. By default it covers only the requested value pages. With verification enabled, it includes the complete checksum blocks touched by the range and extends back to the header and checksum array. Expiring records also include the header. Separate SQEs for the header and data range are not implemented.
 - **System calls**: each poll iteration submits all pending SQEs with one `io_uring_enter`; completions are read from the mmap'd ring and RDMA completions via user-space `ibv_poll_cq`. Amortised, less than one syscall per GET.
-- **Server-side CRC verification is optional.** The engine defaults to `verify_reads = false`; enabling it validates the header and requested checksum blocks on every GET. Readers report corruption without mutating the index; reclaim removes corrupt records through the single writer. The planned network layer must transmit stored `block_crcs` to the client for verification after receipt; that transport path is not implemented yet.
+- **Server-side CRC verification is optional.** The engine defaults to `verify_reads = false`; enabling it validates the header and requested checksum blocks on every GET. Readers report corruption without mutating the index; reclaim reports corruption and retains the victim instead of deleting live records. The planned network layer must transmit stored `block_crcs` to the client for verification after receipt; that transport path is not implemented yet.
 - **A late READ hitting a reused server buffer is safe** (the client's CRC check fails and it retries), so read buffers may be reclaimed on lease expiry without destroying the QP, unlike PUT landing buffers.
 
 Latency estimate (PCIe 5 NVMe, 60–90 µs random 4 KiB read, 8–10 GB/s per disk; 400G NIC ≈ 46 GB/s):
@@ -513,7 +508,7 @@ moat-tools       format / fsck / dump / bench
 
 ## 10. Correctness and testing
 
-1. **Deterministic engine model tests**: `moat-engine` runs randomized operations against an in-memory reference model on a `MemDevice`, "crashing" at arbitrary I/O boundaries (truncating or damaging the tail) and asserting that acknowledged reads are consistent, unacknowledged writes are either visible or missing, and wrong data is never returned. GC, eviction and the tombstone rules are part of the same model.
+1. **Deterministic engine model tests**: `moat-engine` runs randomized operations against an in-memory reference model on a `MemDevice`, "crashing" at arbitrary I/O boundaries (truncating or damaging the tail) and asserting that acknowledged reads are consistent, unacknowledged writes are either visible or missing, and wrong data is never returned. GC and the tombstone rules are part of the same model.
 2. **Protocol state-machine tests**: `moat-transport` drives PUT/GET/timeout/fence paths with a mock transport and asserts the buffer-ownership invariants (a granted buffer is never reused before the immediate completion or a fence).
 3. **Fault injection**: per-disk EIO / slow disk / disk loss; QP errors, interrupted handshakes, clients dying mid-operation.
 4. **Benchmarks**: `cargo bench -p moat-engine` exercises the single-disk engine with a temporary file by default or an explicitly supplied `MOAT_BENCH_DEVICE`; it reports throughput and p50/p99/p999. The future `moat-tools bench` command adds fio-style multi-client load with configurable point and log-normal size distributions for end-to-end testing.
@@ -537,7 +532,7 @@ moat-tools       format / fsck / dump / bench
 
 Relation to two classic systems:
 
-- **Bitcask** (Riak's backend) is this engine's direct ancestor: active file → segment; keydir → sharded in-memory index; hint file → footer; merge → reclaim/eviction; timestamp ordering → lsn ordering (immune to clock skew). Bitcask's three known weaknesses — merge dropping tombstones and resurrecting old values (later fixed by recording enough in the tombstone to drop it only when no older file can exist), the keydir having to fit in memory, and O(records) startup — map to §4.5's tombstone rules, §4.4's memory budget, and §4.6's parallel rebuild and checkpoint. On top of it this design adds raw devices with 4 KiB alignment, small-value packing, per-64 KiB CRCs, hot/cold active segments, concurrent readers under pin counts, and cache eviction.
+- **Bitcask** (Riak's backend) is this engine's direct ancestor: active file → segment; keydir → sharded in-memory index; hint file → footer; merge → reclaim; timestamp ordering → lsn ordering (immune to clock skew). Bitcask's three known weaknesses — merge dropping tombstones and resurrecting old values (later fixed by recording enough in the tombstone to drop it only when no older file can exist), the keydir having to fit in memory, and O(records) startup — map to §4.5's tombstone rules, §4.4's memory budget, and §4.6's parallel rebuild and checkpoint. On top of it this design adds raw devices with 4 KiB alignment, small-value packing, per-64 KiB CRCs, hot/cold active segments, concurrent readers under pin counts.
 - **SPDK blobstore / BlobFS** is the other road: page (4 KiB) / cluster (1 MiB allocation unit by default) / blob, extent RLE and xattrs in metadata page chains, in-place writes, no data journal, no data CRC, recovery by scanning metadata pages to rebuild bitmaps, single-threaded metadata. BlobFS is a thin "one file, one blob, flat namespace" layer for RocksDB. Not chosen because a 1 MiB allocation unit rules out small objects (supporting them means rewriting this engine inside a blob), SPDK requires VFIO unbinding, hugepages and dedicated polling cores (hurting open-source generality) while io_uring + `O_DIRECT` gets within a few percent of line rate for large I/O, and single-threaded metadata does not fit one independent engine per disk. Its allocation model is the extent-plus-bitmap family rather than a log.
 
 Known trade-offs and extension points:

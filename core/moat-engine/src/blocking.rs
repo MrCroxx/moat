@@ -71,12 +71,8 @@ pub fn seal(q: &mut dyn IoQueue, w: &mut Writer) -> Result<()> {
 
 /// Runs one reclaim pass to completion. `None` if there was nothing to
 /// reclaim.
-pub fn reclaim(
-    q: &mut dyn IoQueue,
-    w: &mut Writer,
-    policy: crate::writer::ReclaimPolicy,
-) -> Result<Option<crate::writer::ReclaimReport>> {
-    let Some(ticket) = w.reclaim(q, policy)? else {
+pub fn reclaim(q: &mut dyn IoQueue, w: &mut Writer) -> Result<Option<crate::writer::ReclaimReport>> {
+    let Some(ticket) = w.reclaim(q)? else {
         return Ok(None);
     };
     match wait(q, w, ticket)? {

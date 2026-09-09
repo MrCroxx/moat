@@ -28,9 +28,9 @@
 //! recovery reads footers instead of data. A lock-free in-memory hash *index*
 //! maps every chunk to its newest record. Deletes append *tombstones*. Space is
 //! reclaimed one segment at a time by relocating what is still live and freeing
-//! the segment; the same mechanism implements cache eviction under a different
-//! policy. There is no separate write-ahead log and no embedded key-value
-//! store: the log is the only source of truth.
+//! the segment. Live chunks are retained until explicitly deleted or overwritten.
+//! There is no separate write-ahead log and no embedded key-value store: the log
+//! is the only source of truth.
 //!
 //! # Queues, engines and pipelines
 //!
@@ -102,11 +102,10 @@ mod writer;
 pub use device::{Device, FileDevice, MemDevice};
 pub use engine::{ChunkStat, Engine, RecoveryReport, Usage, format, open};
 pub use error::{Error, Result};
-pub use index::{FLAG_ACCESSED, FLAG_FRAMED, FLAG_LARGE, IndexValue, Location, MAX_READERS};
+pub use index::{FLAG_FRAMED, FLAG_LARGE, IndexValue, Location, MAX_READERS};
 pub use io::{Descriptor, IoQueue, QueueBackend, QueueOptions};
 pub use options::{FormatOptions, Options};
 pub use reader::{ChunkData, ReadCompletion, ReadOutcome, Reader};
 pub use writer::{
-    Completion, DeleteOutcome, LargeValue, Lsn, Outcome, PutOptions, PutOutcome, ReclaimPolicy, ReclaimReport, Ticket,
-    Writer,
+    Completion, DeleteOutcome, LargeValue, Lsn, Outcome, PutOptions, PutOutcome, ReclaimReport, Ticket, Writer,
 };
