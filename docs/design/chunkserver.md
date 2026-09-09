@@ -1,7 +1,8 @@
 # A Chunkserver for Many Large NVMe Drives (design v0)
 
 > Status: design document. `moat-common` and `moat-engine` implement sections 3
-> and 4 on files and in-memory devices; everything else is planned.
+> and 4 on files and in-memory devices. `moat-server` implements disk discovery,
+> placement, recovery and workers; network transports and the client remain planned.
 >
 > The design distils operational experience with large RDMA-attached NVMe
 > storage fleets: rendezvous-style RDMA protocols, shared-CQ reactors, buffer
@@ -21,7 +22,7 @@
 | Metadata persistence | **No RocksDB, no separate WAL.** The log is the WAL. Recovery = read every segment header + footers of sealed segments + forward scan of at most two active segments |
 | Reclaim | **GC and cache eviction are one code path**: pick a segment → decide per record whether to relocate or drop → free the segment. Storage mode uses greedy + age rules; cache mode uses FIFO + reinsertion by access bit |
 | Disk placement | **Deterministic**: weighted rendezvous hashing of `ChunkId` over disks (weight = capacity). Engines are fully independent; adding, removing or losing a disk affects nothing else |
-| Threads | Per NIC, several pinned busy-polling **network workers** (private RDMA reactor + io_uring + registered arena; read any disk directly); per disk, one **disk writer** (sole owner of the log tail, index mutations and reclaim); tokio for the management plane only |
+| Threads | One kind of pinned, busy-polling **worker** (private RDMA reactor + io_uring + arena), with a configurable count bounded by the CPU budget. Every worker reads every disk directly; each disk has exactly one **owner worker** that is also its writer (sole owner of the log tail, index mutations and reclaim). Clients route PUTs to the owner, so the hot path has no cross-thread hop; a forwarding ring between workers is the cold fallback. tokio for the management plane only |
 | RDMA data path | RC QPs, inline SEND control messages. **PUT = server-grant / client-push**; **GET = client RDMA READ pull**; values ≤ `INLINE_MAX` (default 4 KiB) travel inline in one round trip |
 | Integrity | CRC32C per 64 KiB block, end to end (client computes, server verifies, verified again on read); every header, batch and footer carries its own CRC |
 | Transport abstraction | A `Transport` trait; `rdma` (verbs) is the performance path, `tcp` the fallback. The protocol state machine is transport agnostic |
@@ -163,34 +164,34 @@ struct RecordHdr {          // 64 B; crc covers the rest of the header + block_c
 - In a large batch the value starts on the first page boundary after the headers, so the on-disk layout matches the RDMA landing buffer (the client writes to `buf + header_len`) and the batch goes to disk **without a copy**.
 - Fixed overhead per record: 64 B + 4 B per 64 KiB. A large record also pays its header page(s) and tail padding (≈ 0.15% at 4 MiB, ≈ 9% at 64 KiB — hence packing below 64 KiB).
 - A tombstone is a record with `value_len = 0, kind = Tombstone`; it goes into a packed batch and is essentially free.
-- **Read amplification is engineered out for small values.** Inline records are placed so that header plus value span the minimum number of pages their length allows: 8-byte aligned by default, moved to the next page boundary when that saves a page (the gap is zero-filled and skipped by the scanner). Values whose length is within a header of a page multiple (`len % 4096 ∈ (4028, 4096]`, e.g. exactly 4 KiB or 8 KiB) would still be pushed across one extra page by an inline header, so they are written **framed**: headers collected in a header area at the front of the batch (reserved as one slot per page of batch capacity, about 2 % overhead), values page aligned after it, less than one header of padding per value. A framed value is read from its pages alone and verified against the CRC kept in the index; its header is read only when the record has an expiry (expiring values are therefore always inline) or when `verify_header_on_read` is set. Result: every value ≤ 64 KiB costs exactly `ceil(len / 4 KiB)` pages to read.
+- **Page layout for small values.** Inline records are aligned to eight bytes and moved to the next page when necessary to reduce page crossings. Values near a page multiple use a framed layout with grouped headers and page-aligned values. By default, readers use the index to read the requested value pages without a separate header; expiring records still read and validate the header. Enabling `verify_reads` expands the read to the complete checksum blocks touched by the range and includes the record header and checksum array. The index no longer caches a single-block CRC.
 
 ### 4.3 Write pipeline: one writer per disk
 
 ```
-network workers ×N ──(MPSC job queue)──► DiskWriter(disk d) ──io_uring──► NVMe
-       ▲                                        │
-       └──────────(SPSC completions)────────────┘  → network worker sends PutResp
+client ──PUT (routed to owner)──► owner worker of disk d ──io_uring──► NVMe
+other workers ──(SPSC forwarding ring, cold path)──┘
 ```
 
-The `DiskWriter` is one dedicated thread per disk, pinned to a core on the disk's NUMA node. It **exclusively owns** the disk's log tails (two active segments: Hot for foreground writes, Cold for records relocated by reclaim), the right to mutate the index, segment state, reclaim and footer writes. Its loop:
+Each disk has exactly one **owner worker** (§5.3), which holds the disk's `Writer` (see `engine-api.md`). It **exclusively owns** the disk's log tails (two active segments: Hot for foreground writes, Cold for records relocated by reclaim), the right to mutate the index, segment state, reclaim and footer writes. The write pipeline, per PUT that has landed and passed CRC verification:
 
-1. Take a batch of jobs from the queue (each job is a buffer that has already landed via RDMA and passed CRC verification plus record metadata, or an inline small value).
-2. Assign `lsn` (single-threaded increment, no atomics), fill `RecordHdr` **in queue order**; copy small records into the writer's own packing staging buffer (registered with io_uring), use the landing buffer directly for large ones.
-3. Bump-allocate space at the Hot segment's tail (when the remainder is too small, small queued batches may be used to fill it before sealing and switching segments), submit `WriteFixed`. io_uring depth is bounded (default 8 batches / 64 MiB).
-4. On completion, **acknowledge in submission order** (so acknowledged records always form a contiguous prefix and a scan never meets a hole), insert into the index (shard lock, memory only), update the segment's live-byte counter, post a completion to the originating worker.
-5. Flush the current packed batch as soon as the queue is empty (no artificial delay): lowest latency under light load, natural coalescing under heavy load.
+1. Assign `lsn` (single-threaded increment, no atomics), fill `RecordHdr` **in call order**; copy small records into the writer's packing staging buffer (a pool buffer registered with io_uring), use the landing buffer directly for large ones.
+2. Bump-allocate space at the Hot segment's tail; when the remainder is too small the segment is parked for asynchronous sealing and a fresh one is taken without waiting. Submit `WriteFixed` through the worker's queue.
+3. On completion, **apply in submission order** (so acknowledged records always form a contiguous prefix and a scan never meets a hole): insert into the index, update the segment's live-byte counter, deliver the completion.
+4. The pending packed batch is closed at the end of every worker iteration (no timer): lowest latency under light load, natural coalescing under heavy load.
+
+No engine call blocks on I/O; sealing, barriers and reclaim are state machines advanced by `Writer::poll` on the owner's loop. A slow disk therefore never stalls the other disks or the network traffic handled by the same worker.
 
 Why one writer rather than many workers racing on the tail with `fetch_add`:
 - Small-value packing (group commit) needs a single point of aggregation.
 - The tail advances in order, so after a crash the active segment's scan stops at the first invalid batch — there is no "later batch completed, earlier batch missing" hole.
-- Segment allocation, footers, reclaim and index mutation are all single-threaded, so **the engine has no locks except the index shard mutexes**.
+- Segment allocation, footers, reclaim and index mutation are all single-threaded, so **the engine has no locks at all**: the index is a single-writer / multi-reader structure (§4.4), everything else is owned by one thread.
 
-Single-core budget: 7 GB/s of writes is ~1,750 four-megabyte io_uring submissions per second plus memcpy of values under 64 KiB (an all-small-value workload at 7 GB/s is within one core's memcpy budget but close). If profiling shows the writer is the bottleneck, reclaim's reading and filtering move to a helper thread and index updates become CAS; v0 does not pre-build that.
+Single-core budget: 7 GB/s of writes is ~1,750 four-megabyte io_uring submissions per second plus memcpy of values under 64 KiB (an all-small-value workload at 7 GB/s is within one core's memcpy budget but close). Writes are therefore bandwidth bound and one core per disk is enough, which is why writing is *not* spread over workers the way reading is (§5.3). If profiling shows the owner is the bottleneck, reclaim's reading and filtering move to a helper thread; v0 does not pre-build that.
 
 ### 4.4 In-memory index
 
-One open-addressing hash table per disk, split into 64 shards by key hash, one `parking_lot::Mutex` per shard (shard mutexes are negligible when the critical section is memory only).
+One open-addressing hash table per disk, **single writer (the owner worker), any number of readers, no locks**. Readers see a consistent entry through a per-slot sequence number (seqlock: the writer bumps it to odd, writes the 48 bytes, bumps it to even; a reader retries if the number changed or was odd). Removal tombstones the slot; the writer rehashes in place when load or tombstones exceed the threshold, publishing the new table with a single pointer swap and retiring the old one once every reader has passed a grace period (readers are busy-polling workers, so the grace period is one loop iteration of each). This is what `moat-engine/src/index.rs` implements: 64-byte cache-line slots (entry plus sequence number), linear probing, tombstones on removal, a rebuild when live entries plus tombstones reach 7/8 of the table (same size when the live count is at most 3/4, else doubled, within `index_memory_budget`), and per-reader epoch slots — a reader is "inside" a lookup while its epoch is odd — that the writer consults before freeing a retired table.
 
 ```rust
 struct Entry {                 // 48 B
@@ -204,20 +205,20 @@ struct Entry {                 // 48 B
 ```
 
 - Memory ≈ 48 B / (7/8 load) ≈ 55 B per entry. 4 MiB average → 24 disks × 8 million ≈ 11 GB; 64 KiB average → ~170 GB. The extra 8 B over a minimal entry buy single-page reads for page-sized values (see §4.2). The engine enforces an `index_memory_budget`; beyond it PUT returns `NoSpace(index)`. **Deployments dominated by tiny objects must raise the budget or pack at the client.** This is a documented capacity constraint, not a hidden OOM.
-- **Reader pin protocol**: a GET looks the entry up *and* increments the target segment's `pin_count` inside the index shard lock; reclaim removes or rewrites entries under the same lock before waiting for `pin_count == 0`. A reader therefore never observes a reused segment (the post-read verification remains as a second line of defence).
+- **Reader pin protocol**: a GET reads the entry, increments the target segment's `pin_count` (atomic), then rechecks the current table pointer and the entry's sequence number; if either changed, the reader unpins and retries against the current table. Reclaim removes or rewrites entries first and only then waits for `pin_count == 0`, so a reader whose pin is visible to reclaim also saw the entry before removal. A reader therefore never observes a reused segment (optional post-read verification also checks data integrity).
 
 ### 4.5 Delete, GC and eviction
 
-**Delete** is a variant of the write path, forwarded by the network worker to the disk's writer:
+**Delete** is a variant of the write path and runs on the disk's owner worker (routed like a PUT, §6.3):
 
 1. Look the key up; absent → complete `Miss` without writing a tombstone (a key missing from the index either never existed or already has its tombstone on disk).
-2. Present → remove the entry under the shard lock, subtract the record's footprint from its segment's live bytes.
+2. Present → remove the entry (single-writer index update, §4.4), subtract the record's footprint from its segment's live bytes.
 3. Append a 64 B tombstone (`kind = Tombstone`, fresh lsn) to the current packed batch.
 4. **Acknowledge only after that batch's completion**: a delete means "gone after a crash too"; acknowledging after the in-memory removal alone would let recovery resurrect the old record. Latency is one 4 KiB write plus two messages (~20–40 µs on a PLP drive); a 4 KiB page holds 60+ tombstones.
 
-Data is not touched; space is reclaimed asynchronously. A worker mid-read has pinned the segment inside the index lock and is unaffected. `overwrite = true` needs no tombstone (the higher-lsn data record supersedes the old one). TTL expiry is not a delete: a GET that sees an expired record returns `Miss` and posts a "lazy index removal" job to the writer; no tombstone is written, and recovery drops expired records on load.
+Data is not touched; space is reclaimed asynchronously. A worker mid-read has pinned the segment (§4.4) and is unaffected. `overwrite = true` needs no tombstone (the higher-lsn data record supersedes the old one). TTL expiry is not a delete: a GET that sees an expired record returns `Miss` and posts a "lazy index removal" to the owner over the forwarding ring; no tombstone is written, and recovery drops expired records on load.
 
-**GC runs on the DiskWriter thread in small steps interleaved with foreground jobs**, not on its own thread, so it is serialised with PUT/Del by construction and needs no CAS. The reclaim procedure is identical in storage and cache mode:
+**GC runs on the owner worker as a state machine advanced by `Writer::poll`, in small steps interleaved with foreground work**, not on its own thread, so it is serialised with PUT/Del by construction and needs no CAS. The reclaim procedure is identical in storage and cache mode:
 
 ```
 pick_victim() → sequential read of the whole segment (io_uring, rate limited) → per record:
@@ -239,17 +240,17 @@ pick_victim() → sequential read of the whole segment (io_uring, rate limited) 
 Reclaim mechanics:
 
 - The victim is read in 16 MiB windows with a few in flight, into the writer's registered GC buffer, under a per-disk token bucket (default 30% of foreground write bandwidth, released when idle). Large relocations `WriteFixed` straight from the GC buffer (zero copy); small ones go into a packed batch.
-- A relocated record gets a **new lsn** and goes into the Cold active segment. **When its completion arrives, `index[key].loc` is compared with the old location in the victim**: if unchanged the entry is repointed; if a foreground PUT interleaved between the reclaim decision and the completion has overwritten the key, the entry is left alone and the copy is immediately dead data in the Cold segment. Because the writer is single-threaded and lsns are assigned in submission order, the copy's lsn is necessarily lower than that PUT's, so recovery cannot pick the wrong one.
+- A relocated record **keeps its lsn** and goes into the Cold active segment. Reclaim is thereby a purely physical move: the set of `(key, lsn, kind, value)` records recovery sees is unchanged by it, the lsn a client observed for a chunk stays valid across compaction, and no ordering argument between reclaim and concurrent foreground writes is needed. **When the relocation's completion arrives, `index[key].loc` is compared with the old location in the victim**: if unchanged the entry is repointed; if a foreground PUT interleaved between the reclaim decision and the completion has overwritten the key, the entry is left alone and the copy is immediately dead data in the Cold segment (the PUT's lsn is higher, so recovery agrees).
 - After every record is processed, every relocation completed and no index entry points at the victim any more, wait for `pin_count == 0`, rewrite the header as `Free`, push the segment onto the free list.
-- Cost of reclaiming a 1 GiB segment ≈ read 1 GiB + write the live bytes + one shard-lock lookup per record (a segment full of 4 KiB records is 260k lookups, tens of milliseconds of CPU). At 1.5 GB/s the read takes ~0.7 s.
+- Cost of reclaiming a 1 GiB segment ≈ read 1 GiB + write the live bytes + one index lookup per record (a segment full of 4 KiB records is 260k lookups, tens of milliseconds of CPU). At 1.5 GB/s the read takes ~0.7 s.
 - Write amplification: storage mode with greedy selection and hot/cold separation is typically 1.5–3× at 85–90% utilisation, which is why storage mode reports `NoSpace` around 90% instead of filling up; cache mode is `1 + reinsertion ratio`, capped at 1.2×.
 - The read path is unaffected by GC (reads bypass the writer; segments are freed only after pins drain); GC writes share the writer pipeline but foreground PUTs go first.
 - **Hot/Cold active segments**: foreground writes go to Hot, relocations to Cold. Hot/cold separation markedly lowers write amplification (the classic LFS result) at the cost of scanning two active segments on recovery.
 
-**Why the tombstone rules are correct** (the part of log-structured deletion that is easiest to get wrong): recovery keeps the highest `lsn` per key (§4.6). A relocation assigns a **new lsn** (the single writer guarantees lsns increase strictly with actual write time, regardless of which active segment is written). Hence:
-- a live record's lsn is always higher than any of its stale copies, so relocation never changes who wins;
+**Why the tombstone rules are correct** (the part of log-structured deletion that is easiest to get wrong): recovery keeps the highest `lsn` per key (§4.6), and relocation never changes any record's lsn, so the only lsns that matter are the ones assigned by the single writer at put/delete time, strictly increasing in call order. Hence:
+- a copy made by relocation is byte-for-byte the record it copies, lsn included, so if both are ever seen by recovery (a crash between the copy landing and the victim being freed) either one wins and the outcome is the same; a live record's lsn is always higher than any *older version* of the key, so relocation never changes who wins;
 - dropping a tombstone T while an older data version is still on disk would let recovery resurrect it, so T is dropped only when no older segment exists (it sits in the oldest segment) or a newer live version already outranks it;
-- a relocated tombstone gets a new lsn; if the key had become live again the relocated tombstone would wrongly outrank the new data — so the rule checks liveness first, and the single writer guarantees no PUT slips in between the check and the write.
+- a relocated tombstone keeps its lsn, so a put of the same key that is still pending or in flight when the tombstone is copied (and therefore not yet in the index) keeps outranking it; reclaim never has to wait for foreground writes to drain. The one thing reclaim does wait for before it frees the victim is that every batch closed before its last decision has been applied: a record dropped because the index no longer pointed at it may owe that to a tombstone or newer version still in flight, and those must be on disk before the old copy is gone.
 
 ### 4.6 Recovery
 
@@ -271,7 +272,7 @@ Cost: headers 120 MB + footers ≈ index volume (48 B × records; 8 million ≈ 
 1. **Rebuild shards in parallel.** The index is already sharded by key, and each shard's rebuild (including per-key highest-lsn resolution) is independent. During recovery the machine's CPUs are idle: one thread reads footers sequentially and dispatches entries to several shard-building threads. Worst case across the machine: 11 billion entries × 80 ns / 96 cores ≈ 10 s, of the same order as the ~500 GB of random memory writes. **Worst case 10–20 s per machine; typical 1–3 s.** Parallel rebuild does not affect tombstone correctness: taking the maximum lsn is commutative and associative, so the order in which entries arrive is irrelevant (another reason to order by lsn rather than physical position); all records of one key land in one shard because keys are placed deterministically on one disk and sharded by key hash; lsns are unique per disk. The one requirement is a **per-disk barrier**: `Dead` markers may only be dropped once *all* of the disk's input (every footer and scan) has been consumed, otherwise an older data record processed later would resurrect.
 2. **Fuzzy index checkpoint** (phase two; formats and interfaces reserved in v0). No writer stall, no copy-on-write:
    - At checkpoint start the writer reports a watermark: `L0` = the lowest lsn among in-flight writes (the next lsn if none), the position of the **oldest in-flight batch** in each active segment (in-flight writes sit before the tail pointer), and the table of `(seg_no → seg_seq, state)`.
-   - A low-priority thread per disk copies the hash table shard by shard in 1 MiB slices, holding the shard lock ~100 µs per slice, memcpy to staging, release, then `WriteFixed` into `kind = Index` segments. Maximum stall per request ≈ 100 µs; p99 is untouched.
+   - A low-priority thread per disk copies the hash table in 1 MiB slices (readers are never blocked; a slice whose entries changed underneath, detected through the per-slot sequence numbers, is re-copied), memcpy to staging, then `WriteFixed` into `kind = Index` segments. The writer is never stalled; p99 is untouched.
    - After all slices complete, superblock A/B flips to the new image (with `L0`, replay start positions, the segment table, table capacity, hasher seed, per-slice CRCs); the old image's segments are freed.
    - Recovery: read the image straight into table memory (zero hashing, 21 GB ≈ 2 s); scan the two active segments from the recorded positions and every segment with `seg_seq` above the checkpoint's maximum; replay only records with `lsn ≥ L0`, merging with the image by **highest lsn** (image entries carry their lsn); drop entries pointing at `Free` segments or at segments whose `seg_seq` differs from the checkpoint's table (can be done lazily on read).
    - Correctness: every index change after T0 is either a record with `lsn ≥ L0` (inserts, overwrites, relocations — taking the *lowest in-flight* lsn is what keeps in-flight writes' late index updates inside the replay range; a delete's index removal and its tombstone lsn are assigned in the same job, so the tombstone has `lsn ≥ L0`), or has no record at all — only cache-mode Drop eviction (caught by the segment-table check; if the segment has not been reused the entry comes back as live, harmless for a cache) and lazy TTL removal (re-evaluated on read). Slices are copied under the lock, so no torn entries.
@@ -283,7 +284,7 @@ Each disk recovers and comes online independently; a slow disk does not block th
 ### 4.7 Durability and consistency summary
 
 - PUT acknowledged ⇔ the completion of the record's batch `WriteFixed` has returned (durable on a PLP drive). With `sync_mode = fdatasync_per_batch` an `IORING_OP_FSYNC(DATASYNC)` follows each batch.
-- Every read verifies: `RecordHdr.magic/crc` → `key` matches → CRC of every 64 KiB block in the requested range. Any failure returns `Corrupt` (dropping the index entry and counting a metric); **wrong data is never returned**.
+- **Read verification is optional and disabled by default.** With `Options::verify_reads = true`, each read validates `RecordHdr.magic/crc`, key, LSN, value length and record kind, then verifies every 64 KiB checksum block touched by the requested range; failures return `Corrupt`. With verification disabled, readers rely on the index and segment pin to keep the location valid without scanning the payload. Expiring records still read and validate the header for TTL. Stored checksums and recovery/reclaim validation are unchanged. End-to-end client verification and checksum transport remain future network-layer work.
 - A crash can only lose unacknowledged writes; "acknowledged but unreadable" cannot happen short of media failure.
 - No partial writes inside a chunk → no COW, no chunk locks, no fragment merging.
 
@@ -307,18 +308,29 @@ Each disk recovers and comes online independently; a slow disk does not block th
 ### 5.3 Threads
 
 ```
-NIC0 ─ workers 0..7  ┐                              ┌ DiskWriter 0  ── nvme0n1
-NIC1 ─ workers 8..15 ├─ any worker reads any disk ─►├ DiskWriter 1  ── nvme1n1
-...                  │  PUT job → that disk's writer│ ...
-NIC3 ─ workers 24..31┘                              └ DiskWriter 23 ── nvme23n1
-acceptor (TCP handshake) · admin/metrics (tokio) · NVMe health probe
+worker A  (owns disk X)    ┐  every worker: RDMA reactor + io_uring + arena
+worker B  (owns disk Y)    │  every worker reads every disk on its own ring
+...                       ├─ GET: served where received
+worker C  (owns no disk)   ┘  PUT: routed to the owner; forwarding is a cold path
+recovery threads (start-up only) · admin/metrics (tokio) · NVMe health probe
 ```
 
-- **Network workers** (default 8 per NIC; throughput on 400G NICs typically saturates between 8 and 16 busy-polling workers per NIC, and 8 is usually enough with 4 MiB I/O): pinned to cores on the NIC's NUMA node; each owns a `Reactor` (ibv context + PD + one shared CQ, poll batch 64), an io_uring ring (reads), a registered arena (default 1 GiB, hugepages, NUMA local, `RELAXED_ORDERING`), a connection table, an in-flight request table and pending queues. Busy polling with no `yield` when idle (handing a pinned worker back to the scheduler visibly raises p99); slow timers throttled to once per 100 ms.
-- **DiskWriter**: see §4.3.
-- **Management plane**: tokio, only HTTP admin, Prometheus and topology reporting; never touches data.
-- The only cross-thread communication on the hot path is the worker → writer job queue and the writer → worker completion queue, both lock-free rings.
-- **`poll_mode = busy | adaptive`**: `adaptive` switches to `ibv_req_notify_cq` + epoll sleeping after an idle threshold, for open-source users who cannot dedicate cores. Default `busy`.
+**Why one kind of worker.** Small reads can exhaust a submission thread's CPU budget before reaching device capacity. Allowing multiple workers to read each disk avoids tying read concurrency to the number of disk owners. Keeping network processing and I/O submission on the same worker avoids a cross-thread handoff on each request. Two consequences:
+
+- Reads are issued **from the worker that received the request**, on that worker's own ring, against any disk. No hop.
+- Workers are not split into a network pool and a disk pool. A split would need the same total CPU, add a hop to every operation and, worse, fix the ratio between the two pools: an all-large workload (limited by network bandwidth) idles the disk pool while an all-small workload saturates both with no slack. One kind of worker that does both adapts by itself.
+
+**Worker.** Pinned to one core; each owns a `Reactor` (ibv context + PD + one shared CQ on the NIC nearest its NUMA node, poll batch 64), one `IoQueue` (io_uring; every disk attached as a descriptor, every arena registered as a fixed buffer), one arena (default 1 GiB, hugepages, NUMA local, `RELAXED_ORDERING`), one `Reader` per disk, a connection table, an in-flight request table and pending queues. Busy polling with no `yield` when idle (handing a pinned worker back to the scheduler visibly raises p99); slow timers throttled to once per 100 ms. Worker count is a configuration knob bounded by cores; the default leaves the management plane and the OS a few cores and pins the rest.
+
+**Disk owner.** Each disk is assigned to one worker, preferably on the disk's NUMA node, which additionally holds the disk's `Writer` and runs its reclaim (§4.3). Ownership is published together with the worker's QP endpoint through `/status`, so clients (§7) send a PUT straight to the owner. The owner's loop is the same loop as any other worker's; write work is simply more `Writer::put` / `Writer::poll` calls on it.
+
+**Forwarding rings (cold path).** Between every pair of workers there are two SPSC lock-free rings (256 slots each; the ring count grows quadratically with the worker count). A PUT that arrives at a non-owner (stale routing metadata, a client that does not route, the TCP fallback) is forwarded with its landing buffer; the owner writes it and returns the completion on the reverse ring; the receiving worker answers the client and frees the buffer. SPSC rather than MPSC so producers never contend; each worker scans its inbound rings once per iteration. Routing is an optimisation, never a correctness requirement.
+
+**Buffers cross threads, but are freed at home.** A landing buffer may travel to the owner and be read by the owner's io_uring (all arenas are registered on all rings and all PDs at start-up; they never move), but it is returned to the pool only by the worker that allocated it. Pools are therefore thread private and lock free; a buffer on another thread is represented by a `Send` claim (arena index, offset, home worker) that is converted back into the pool's handle when it comes home on the reverse ring.
+
+**Management plane**: tokio, only HTTP admin, Prometheus and topology reporting; never touches data. **Recovery**: `open` is blocking and runs on temporary threads, all disks in parallel, before the workers start; each engine is then attached to its owner's queue.
+
+**`poll_mode = busy | adaptive`**: `adaptive` switches to `ibv_req_notify_cq` + epoll sleeping after an idle threshold, for open-source users who cannot dedicate cores. Default `busy`.
 
 ### 5.4 Admission and QoS
 
@@ -326,7 +338,7 @@ acceptor (TCP handshake) · admin/metrics (tokio) · NVMe health probe
 |---|---|---|
 | Per-disk read bytes in flight | `ByteWindow`, CAS reservation, RAII permit | 32 MiB (Little's law: 10 GB/s × 2 ms target × 1.5 headroom) |
 | Per-disk write bytes in flight | Same, **fully separate** from the read window, no combined total | 32 MiB + writer queue depth 256 |
-| Worker arena | Size-class allocation (4 KiB … CHUNK_MAX + header), queue when exhausted | 1 GiB per worker |
+| Worker arena | Thread-private buddy pool (4 KiB … CHUNK_MAX + header), no lock; `Busy` when exhausted, request queued and retried after the next poll | 1 GiB per worker |
 | GC / migration bandwidth | Per-disk token bucket | 30% of foreground writes |
 | Queueing | Bounded queues bucketed by wait reason + deadline, `Throttle` on expiry | queue 1024 / deadline 50 ms |
 
@@ -369,17 +381,19 @@ Fixed 32 B header + type-specific body, `bytemuck` POD, little endian; DMA'd fir
 ### 6.3 PUT: server-grant / client-push
 
 ```
-Client                                        Server worker
-  |-- SEND Put{req,id,len,crcs} --------------->|  disk = disk_of(id); reserve write window (CAS); allocate arena len+header
+Client                                        Owner worker of disk_of(id)
+  |-- SEND Put{req,id,len,crcs} --------------->|  reserve write window; allocate arena len+header
   |<- SEND PutGrant{req,addr,rkey} ------------ |  (or PutResp{Throttle|Exists|NoSpace})
   |== RDMA_WRITE value → addr ================>|
   |-- RDMA_WRITE_WITH_IMM(0 B, imm=req) ------->|  RC ordering guarantees the value is visible; consumes one RECV
-  |                                              |  verify block_crcs → fill header page → job → DiskWriter
-  |                                              |  writer: append → completion → index insert → completion to worker
+  |                                              |  verify block_crcs → Writer::put_large (zero copy, same thread)
+  |                                              |  Writer::poll: batch on disk → index insert → Completion
   |<- SEND PutResp{req,Ok,lsn} ---------------- |  release arena / write window
 ```
 
-`len ≤ INLINE_MAX`: `Put` carries the value; it goes straight to the writer queue — **one round trip**.
+The client computes `disk_of(id)` itself (§5.2 is deterministic) and sends the request to that disk's owner worker (§5.3, published via `/status`), so the whole PUT runs on one thread. If the request lands on another worker it is forwarded over the SPSC ring and answered from the receiving worker after the owner's completion comes back — correct, one hop slower, and only taken when routing metadata is stale.
+
+`len ≤ INLINE_MAX`: `Put` carries the value; it goes straight into the writer's packed batch — **one round trip**.
 
 ### 6.4 GET: client RDMA READ pull
 
@@ -398,10 +412,10 @@ Client                                        Server worker
 
 Read path essentials:
 
-- **The whole path stays on the network worker that received the request; there is no cross-thread hand-off** (only writes hop to the DiskWriter). It touches three shared things: an index shard lock (memory only), the per-disk read-window atomic, and a segment pin counter. The pin is taken inside the index shard lock (§4.4), and cache mode's `ACCESSED` bit is set in the same critical section.
-- **I/O count**: a large record is laid out as `[header page(s)][value]`, so a whole-chunk read is **one contiguous I/O**; an inline small record reads its enclosing page(s) (header and value together); a framed small record reads exactly its value pages and is verified from the index CRC. Only a range read with `offset > 0` needs two SQEs (header and data pages), submitted together and completed in parallel; for small offsets the contiguous span from header to range end is read instead.
+- **The whole path stays on the worker that received the request; there is no cross-thread hand-off.** It touches three shared things, none of them a lock: a seqlock-protected index entry (memory only), the per-disk read-window atomic, and a segment pin counter (§4.4). Cache mode's `ACCESSED` bit is an atomic or on the entry's flags.
+- **I/O count.** The current reader submits one contiguous I/O per request. By default it covers only the requested value pages. With verification enabled, it includes the complete checksum blocks touched by the range and extends back to the header and checksum array. Expiring records also include the header. Separate SQEs for the header and data range are not implemented.
 - **System calls**: each poll iteration submits all pending SQEs with one `io_uring_enter`; completions are read from the mmap'd ring and RDMA completions via user-space `ibv_poll_cq`. Amortised, less than one syscall per GET.
-- **Server-side CRC verification is optional**: the client verifies end to end against `block_crcs` regardless; the server's check exists to detect on-disk corruption proactively and drop the index entry. Default on (`verify_on_read = both`), configurable `client_only`. Verifying a 4 MiB record costs ~50–80 µs on the worker (CRC32C at 50–80 GiB/s per core with `crc-fast`) — a visible slice of large-read latency; it can be overlapped with the client's READ after benchmarking.
+- **Server-side CRC verification is optional.** The engine defaults to `verify_reads = false`; enabling it validates the header and requested checksum blocks on every GET. Readers report corruption without mutating the index; reclaim removes corrupt records through the single writer. The planned network layer must transmit stored `block_crcs` to the client for verification after receipt; that transport path is not implemented yet.
 - **A late READ hitting a reused server buffer is safe** (the client's CRC check fails and it retries), so read buffers may be reclaimed on lease expiry without destroying the QP, unlike PUT landing buffers.
 
 Latency estimate (PCIe 5 NVMe, 60–90 µs random 4 KiB read, 8–10 GB/s per disk; 400G NIC ≈ 46 GB/s):
@@ -419,7 +433,7 @@ Latency estimate (PCIe 5 NVMe, 60–90 µs random 4 KiB read, 8–10 GB/s per di
 
 These figures are design targets, not portable benchmark results. Performance depends on the CPU, storage firmware, kernel, filesystem or raw-device mode, queue configuration and memory topology. Reproducible results must report that environment, all `MOAT_BENCH_*` variables and the corresponding `fio` configuration instead of relying on developer-machine defaults.
 
-Throughput: large I/O is NIC bound (24 disks ≈ 200 GB/s > 4 × 46 GB/s), ~6 GB/s and ~1,400 GETs per worker with the CPU mostly idle, ~2–3 cores of CRC spread over 32 workers; small I/O is CPU / message-rate bound (~1–2 M op/s per worker, 30–60 M op/s over 32 workers, matching ~40 M random-read IOPS across 24 disks): tens of millions of 4 KiB GETs per second per machine. Server read buffers are held only a few hundred microseconds until `GetDone`, ~10–20 MB in flight per NIC.
+Throughput depends on device, network and CPU capacity. Large reads may be limited by device or network bandwidth, while small reads may be limited by the workers' submission and completion overhead. Worker count and queue depth are configurable. Server read buffers remain allocated until `GetDone` or lease expiry.
 
 Why GET pulls while PUT pushes (both patterns have production track records):
 
@@ -438,7 +452,7 @@ Why GET pulls while PUT pushes (both patterns have production track records):
 ### 6.6 verbs details
 
 - RC QPs; control plane SEND/RECV (inline ≤ INLINE_MAX); data plane RDMA WRITE / WRITE_WITH_IMM (PUT), RDMA READ (GET). Server arena MR access `LOCAL_WRITE | REMOTE_WRITE | REMOTE_READ`; client MR `LOCAL_WRITE | REMOTE_WRITE` (a READ's landing is an inbound write).
-- **`IBV_ACCESS_RELAXED_ORDERING` must be on, and must be registered through the `ibv_reg_mr_iova2` ABI** (bindgen cannot bind the C macro, and the old ABI silently drops optional flags at bit ≥ 20). On AMD EPYC this is a ~2× bandwidth difference, and it acts on the PCIe inbound-write side: the server MR for PUT, the client MR for GET.
+- **`IBV_ACCESS_RELAXED_ORDERING` must be on, and must be registered through the `ibv_reg_mr_iova2` ABI** (bindgen cannot bind the C macro, and the old ABI silently drops optional flags at bit ≥ 20). Its performance effect depends on the platform. It acts on the PCIe inbound-write side: the server MR for PUT, the client MR for GET.
 - One `Reactor` per worker = context + PD + one shared CQ, routing completions by `wc.qp_num` to `Weak<Endpoint>`; a single QP error poisons only its endpoint.
 - QP parameters: `max_send_wr = depth*3`, `max_recv_wr = depth`, `sq_sig_all = false`, `min_rnr_timer 12 / timeout 14 / retry 7 / rnr_retry 7 / max_rd_atomic 16`, MTU = min of both ends' `active_mtu`, SL0, GRH off on native IB (on for RoCE, detected during the handshake).
 - Connection setup: out-of-band TCP exchange of `PeerInfo{qpn, psn, lid/gid, mtu, depth, proto_version, inline_max, chunk_max}`; the TCP connection doubles as the liveness probe (EOF → fence).
@@ -453,10 +467,11 @@ Same messages; `PutGrant` degrades to a `Continue` after which the client stream
 
 ## 7. Client library (`moat-client`) and large objects
 
-- Node routing: **HRW (rendezvous) hashing** over `node_id` (derived from the hostname, independent of list order); membership is a file with one hostname per line, hot-reloaded periodically; nodes report their worker endpoints through HTTP `/status`. No central metadata service, no consensus.
+- Node routing: **HRW (rendezvous) hashing** over `node_id` (derived from the hostname, independent of list order); membership is a file with one hostname per line, hot-reloaded periodically; nodes report their worker endpoints **and the disk → owner-worker map with its `layout_epoch`** through HTTP `/status`. No central metadata service, no consensus.
+- Worker routing inside a node: a PUT goes to the owner of `disk_of(id)` (§5.2, §5.3); a GET goes to any worker, chosen round robin or by the client's NIC locality. A stale owner map costs one forwarding hop on the server, never a wrong answer; the client refreshes it on the next `/status` poll.
 - One RC connection per (client, worker); synchronous and asynchronous (tokio) APIs over a single-threaded verbs actor (bounded command queue in, completion event stream out, pinned to a NIC-local core).
 - `ObjectWriter / ObjectReader`: split at `CHUNK_MAX`, configurable concurrency (default 64 in flight), per-chunk retries, manifest aggregation. A 100 GB object takes ~2 s on one 400G NIC.
-- The client computes the 64 KiB block CRCs (`crc-fast`, carry-less-multiplication folding: 50–80 GiB/s per core on current x86 servers, independent of block size).
+- The client computes the 64 KiB block CRCs (`crc-fast`, with runtime selection of hardware-accelerated kernels).
 
 ---
 
@@ -536,7 +551,7 @@ Known trade-offs and extension points:
 ## 12. Suggested order of implementation
 
 1. `moat-common` + `moat-engine` + model tests: get the layout, writer, index, reclaim and recovery right first — this is where all the correctness lives. *(done, including the io_uring queue, registered buffer pool and zero-copy paths; a blocking queue keeps tests deterministic and the engine portable)*
-2. `moat-server` with TCP transport + `moat-client` over TCP: end-to-end usable, developable and testable on machines without RDMA.
+2. `moat-server` with TCP transport + `moat-client` over TCP: end-to-end usable, developable and testable on machines without RDMA. *(the node layer without a transport is done: `core/moat-server` has NVMe discovery by serial, rendezvous placement, the pinned worker with one io_uring queue per worker and a pluggable request `Handler`, parallel recovery and owner assignment, and a whole-node benchmark; the TCP transport is the next `Handler`)*
 3. `moat-verbs` + `moat-transport::rdma`: reactor, endpoints, leases/fencing; drive to line rate with `moat-tools bench`.
 4. Multi-disk: NVMe discovery, placement, layout epochs, admission.
 5. Cache-mode policies, TTL, `fsck`, observability.

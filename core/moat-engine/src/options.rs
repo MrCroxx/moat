@@ -26,7 +26,6 @@ use moat_common::{PAGE_SIZE, is_aligned};
 
 use crate::{
     error::{Error, Result},
-    io::QueueOptions,
     layout::{BATCH_HEADER_LEN, SEGMENT_HEADER_LEN, footer_len, large_batch_len},
 };
 
@@ -90,27 +89,25 @@ pub struct Options {
     /// Default: 1 MiB.
     pub batch_limit: usize,
     /// Read window used when scanning segments (recovery, reclaim). Grows
-    /// automatically to fit the largest possible batch. Default: 4 MiB.
+    /// automatically to fit the largest possible batch; reclaim shrinks it
+    /// to the queue pool's largest class. Default: 4 MiB.
     pub scan_window: usize,
-    /// Number of index shards (rounded up to a power of two). Default: 64.
-    pub index_shards: usize,
+    /// Initial number of index slots (rounded up to a power of two; 64 bytes
+    /// each). The table doubles as needed within `index_memory_budget`.
+    /// Default: 1 Mi slots (64 MiB).
+    pub index_capacity: usize,
+    /// Maximum bytes the index table may occupy. Once reached, puts of new
+    /// chunks fail with [`Error::IndexFull`](crate::Error::IndexFull).
+    /// Default: unlimited.
+    pub index_memory_budget: usize,
     /// Whether `flush` also flushes the device's volatile write cache. Leave
     /// off on devices with power-loss protection. Default: `false`.
     pub sync_on_flush: bool,
-    /// The writer's I/O queue: depth and buffer pool. The pool's maximum class
-    /// is raised automatically to fit the largest batch, the batch limit and
-    /// the scan window.
-    pub queue: QueueOptions,
-    /// Minimum writer pool capacity as a multiple of its largest required
-    /// buffer class. Larger values allow more large I/O operations to remain
-    /// in flight; smaller values reduce mapped and registered memory. The
-    /// configured pool size remains the lower bound. Default: 8.
-    pub writer_pool_capacity_multiplier: usize,
-    /// Always read and verify a record's header (key, LSN, kind) on `get`.
-    /// Framed single-block records are otherwise verified from the CRC in the
-    /// index alone, which costs one page per read; with this on they read
-    /// their batch's header area as well. Default: `false`.
-    pub verify_header_on_read: bool,
+    /// Verify the record header and every checksum block touched by each `get`.
+    /// Default: `false`; reads trust the index and do not scan the payload with
+    /// the CPU. Expiring records still read and validate their header for TTL.
+    /// Writing checksums and recovery/reclaim validation are unaffected.
+    pub verify_reads: bool,
 }
 
 impl Default for Options {
@@ -120,11 +117,10 @@ impl Default for Options {
             pack_threshold: 64 * 1024,
             batch_limit: 1024 * 1024,
             scan_window: 4 * 1024 * 1024,
-            index_shards: 64,
+            index_capacity: 1 << 20,
+            index_memory_budget: usize::MAX,
             sync_on_flush: false,
-            queue: QueueOptions::default(),
-            writer_pool_capacity_multiplier: 8,
-            verify_header_on_read: false,
+            verify_reads: false,
         }
     }
 }
@@ -135,11 +131,10 @@ impl std::fmt::Debug for Options {
             .field("pack_threshold", &self.pack_threshold)
             .field("batch_limit", &self.batch_limit)
             .field("scan_window", &self.scan_window)
-            .field("index_shards", &self.index_shards)
+            .field("index_capacity", &self.index_capacity)
+            .field("index_memory_budget", &self.index_memory_budget)
             .field("sync_on_flush", &self.sync_on_flush)
-            .field("queue", &self.queue)
-            .field("writer_pool_capacity_multiplier", &self.writer_pool_capacity_multiplier)
-            .field("verify_header_on_read", &self.verify_header_on_read)
+            .field("verify_reads", &self.verify_reads)
             .finish_non_exhaustive()
     }
 }
@@ -152,9 +147,9 @@ impl Options {
         if self.batch_limit < PAGE_SIZE as usize {
             return Err(Error::InvalidOption("batch_limit must be at least one page".into()));
         }
-        if self.writer_pool_capacity_multiplier == 0 {
+        if self.index_memory_budget < self.index_capacity.max(16).next_power_of_two() * crate::index::SLOT_BYTES {
             return Err(Error::InvalidOption(
-                "writer_pool_capacity_multiplier must be at least one".into(),
+                "index_memory_budget must hold the initial index capacity".into(),
             ));
         }
         Ok(())
@@ -166,13 +161,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn writer_pool_capacity_multiplier_must_be_positive() {
-        assert_eq!(Options::default().writer_pool_capacity_multiplier, 8);
+    fn index_budget_must_cover_initial_capacity() {
         let options = Options {
-            writer_pool_capacity_multiplier: 0,
+            index_capacity: 1024,
+            index_memory_budget: 1024,
             ..Default::default()
         };
         assert!(matches!(options.validate(), Err(Error::InvalidOption(_))));
+        assert!(Options::default().validate().is_ok());
     }
 }
 

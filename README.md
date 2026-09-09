@@ -23,7 +23,7 @@ The design document lives at [`docs/design/chunkserver.md`](docs/design/chunkser
 | [`moat-common`](core/moat-common) | Chunk identifiers, CRC32C block checksums, page alignment, huge-page arenas and the buddy buffer pool | usable |
 | [`moat-engine`](core/moat-engine) | Single-disk engine: segments, index, reclaim/eviction, recovery; io_uring with registered buffers, zero-copy read and write paths | usable on raw devices, files and in memory |
 | `moat-transport` | RDMA (verbs) and TCP transports behind one protocol | planned |
-| `moat-server` | Multi-disk node: NVMe discovery, placement, admission, workers | planned |
+| [`moat-server`](core/moat-server) | Multi-disk node: NVMe discovery, placement, recovery and workers | usable without a network transport |
 | `moat-client` | Node routing, connection management, large-object striping | planned |
 | `moat-tools` | `format`, `fsck`, `dump`, `bench` | planned |
 
@@ -32,30 +32,47 @@ The design document lives at [`docs/design/chunkserver.md`](docs/design/chunkser
 ```rust
 use std::sync::Arc;
 use moat_common::ChunkId;
-use moat_engine::{FileDevice, FormatOptions, Options, PutOptions, QueueOptions};
+use moat_engine::{
+    FileDevice, FormatOptions, Options, PutOptions, QueueOptions, blocking, uring::UringQueue,
+};
 
 let device = Arc::new(FileDevice::create("disk.img", 64 << 30, /* direct */ true)?);
 moat_engine::format(&*device, &FormatOptions::default())?;
 
-let opened = moat_engine::open(device, Options::default())?;
-let (mut writer, reader) = (opened.writer, opened.reader);
-let mut ring = reader.ring(&QueueOptions::default())?; // one per reading thread
+let (engine, _) = moat_engine::open(device, Options::default())?;
+let mut queue = UringQueue::new(&QueueOptions::default())?;
+let mut writer = engine.writer(&mut queue)?;
+let mut reader = engine.reader(&mut queue)?;
 
 let id = ChunkId::from_u128(1);
-writer.put(id, b"hello", PutOptions::default())?;
-writer.flush()?;
-assert_eq!(ring.get_sync(&id, None)?.as_deref(), Some(&b"hello"[..]));
+writer.put(&mut queue, id, b"hello", PutOptions::default())?;
+blocking::flush(&mut queue, &mut writer)?;
+assert_eq!(
+    blocking::get(&mut queue, &mut reader, &id, None)?.as_deref(),
+    Some(&b"hello"[..]),
+);
+blocking::seal(&mut queue, &mut writer)?;
+writer.detach(&mut queue);
+reader.detach(&mut queue);
 ```
 
-The writer and every read ring own an io_uring instance and a pool of
-pre-registered, huge-page backed buffers; values move between those buffers and
-the device without copies (`Writer::prepare_large` / `put_large` for writes,
+Each worker owns an io_uring queue and a pool of registered buffers. Its readers
+and writers share that queue across disks; each disk has a single writer.
+Values move between buffers and the device without copies
+(`Writer::prepare_large` / `put_large` for writes,
 `ChunkData` for reads). `cargo bench -p moat-engine` measures throughput and
 latency on a file or, with `MOAT_BENCH_DEVICE`, a raw device (which it
 **formats**).
 
 `cargo test --workspace` runs the unit tests plus the engine's crash-injection,
 reclaim and randomized model tests against an in-memory device.
+
+Server-side payload CRC verification is disabled by default
+(`Options::verify_reads = false`). Set it to `true` to verify the record header
+and every 64 KiB checksum block touched by each read. Unchecked reads cover
+only the requested pages; expiring records still read and validate their
+header. Checksum generation and recovery/reclaim validation are unchanged.
+Client-side transport and verification are not implemented yet.
 
 ## Benchmarking
 
@@ -87,6 +104,7 @@ The workload can be adjusted with the following environment variables:
 | `MOAT_BENCH_READERS` | Concurrent reader threads | 1 |
 | `MOAT_BENCH_LARGE` | Large-value size in bytes | 1 MiB |
 | `MOAT_BENCH_SMALL` | Small-value size in bytes | 4 KiB |
+| `MOAT_BENCH_VERIFY` | Enable CRC verification on every read in the engine and node benchmarks | unset |
 | `MOAT_BENCH_SYNC` | Use the blocking queue instead of io_uring when set | unset |
 
 Benchmark results are hardware-specific. Published results should include the

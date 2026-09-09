@@ -37,9 +37,15 @@ pub enum Error {
     #[error("no free segment available")]
     NoSpace,
 
-    /// No I/O buffer or queue slot is available right now and nothing is in
-    /// flight that could free one. Retry after releasing buffers.
-    #[error("no i/o buffer or queue slot available")]
+    /// The index has reached its memory budget; no new chunk can be added
+    /// until others are deleted or reclaimed.
+    #[error("index memory budget exhausted")]
+    IndexFull,
+
+    /// The buffer pool has no buffer of the requested class right now (or the
+    /// resource asked for already exists: a second writer, a running reclaim
+    /// pass). Poll to return buffers and retry.
+    #[error("resource busy: no buffer available or the operation is already running")]
     Busy,
 
     /// The value exceeds the chunk size limit recorded in the superblock.

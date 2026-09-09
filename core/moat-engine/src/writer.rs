@@ -14,11 +14,20 @@
 
 //! The single writer of a disk.
 //!
-//! Exactly one [`Writer`] exists per open engine. It owns the log tail of the
-//! hot and cold active segments, assigns LSNs, performs every index mutation,
-//! seals segments, and runs reclaim. Because all of that happens on one thread,
-//! the engine needs no locking beyond the index shard mutexes that readers
-//! also take.
+//! Exactly one [`Writer`] exists per engine. It owns the log tail of the hot
+//! and cold active segments, assigns LSNs, performs every index mutation,
+//! seals segments, and runs reclaim. Because all of that happens on one
+//! thread, the engine needs no locking at all: the index is a single-writer
+//! structure, and everything else the writer touches is owned by it.
+//!
+//! # No call blocks
+//!
+//! Every method either does memory work and returns, enqueues I/O on the
+//! caller's [`IoQueue`] and returns a [`Ticket`], or reports
+//! [`Error::Busy`] (the pool is out of buffers; poll and retry). Completion is
+//! observed only through [`Writer::poll`], which also advances the state
+//! machines behind sealing, barriers and reclaim. A slow disk therefore never
+//! stalls the other disks that share its worker.
 //!
 //! # I/O pipeline
 //!
@@ -26,35 +35,48 @@
 //! staging batch (inline or framed, see [`crate::layout`]), large values into
 //! a buffer whose value area the caller may fill directly
 //! ([`Writer::prepare_large`]), so the only copy on the write path is the one
-//! the caller chooses to make. Batches are submitted to the writer's
-//! [`IoQueue`] and several stay in flight; completions are applied strictly in
-//! submission order, so acknowledged records always form a contiguous prefix of
-//! the log and a crash never leaves a hole in front of acknowledged data.
+//! the caller chooses to make. Closed batches wait in a *ready* queue until
+//! the I/O queue has room, then stay in flight; completions are applied
+//! strictly in submission order, so acknowledged records always form a
+//! contiguous prefix of the log and a crash never leaves a hole in front of
+//! acknowledged data. A segment header is written before any batch of the
+//! segment, a footer before the header that marks the segment sealed, and a
+//! segment returns to the free list only after its header says so on disk.
 //!
 //! A failed write truncates its segment at the failure offset: that batch and
-//! every later batch of the same segment are reported as failed, the segment is
-//! sealed with the records that did land, and writing continues on a fresh
+//! every later batch of the same segment are reported as failed, the segment
+//! is sealed with the records that did land, and writing continues on a fresh
 //! segment.
+//!
+//! # Reclaim and LSNs
+//!
+//! Relocated records keep their LSN. Reclaim is thereby a purely physical
+//! move: the set of `(key, lsn, kind, value)` records recovery sees is
+//! unchanged by it, so no ordering argument between reclaim and concurrent
+//! foreground writes is needed, and the LSN a client observed for a chunk
+//! stays valid across compaction. Whether a relocation takes effect in memory
+//! is decided when it is applied (the index must still point at the old
+//! location); a copy superseded meanwhile is dead data in the cold segment.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     io,
-    sync::Arc,
-    thread,
+    sync::{Arc, atomic::Ordering},
 };
 
 use moat_common::{
-    ChunkId, PAGE_SIZE, PooledBuf, align_up, block_checksums, block_count, chunk_id::ChunkIdHashBuilder,
+    AlignedBuf, CHECKSUM_BLOCK_SIZE, ChunkId, PAGE_SIZE, PooledBuf, align_up, block_checksums, block_count,
+    chunk_id::ChunkIdHashBuilder, crc32c, verify_blocks_with,
 };
 
 use crate::{
     error::{Error, Result},
-    index::{IndexValue, InsertOutcome, Location, flags_from_record},
-    io::{IoCompletion, IoQueue},
+    index::{IndexValue, IndexWriter, InsertOutcome, Location, flags_from_record},
+    io::{Descriptor, IoCompletion, IoQueue},
     layout::{
         BATCH_HEADER_LEN, BatchHeader, BatchKind, FooterEntry, RECORD_ALIGN, RECORD_FLAG_EXPIRES, RECORD_FLAG_FRAMED,
-        RECORD_FLAG_LARGE, RecordGeometry, RecordHeader, RecordKind, SegmentHeader, SegmentKind, SegmentState,
-        encode_footer, footer_len, large_batch_len, large_value_offset, prefer_framed, record_meta_len,
+        RECORD_FLAG_LARGE, RecordGeometry, RecordHeader, RecordKind, SEGMENT_HEADER_LEN, SegmentHeader, SegmentKind,
+        SegmentState, encode_footer, footer_len, large_batch_len, large_value_offset, prefer_framed, record_meta_len,
     },
     scan::{BatchStep, max_batch_len, next_batch, parse_batch},
     shared::Shared,
@@ -63,10 +85,11 @@ use crate::{
 /// A per-disk write sequence number.
 pub type Lsn = u64;
 
-/// Identifies a submitted write until its [`Completion`] is delivered.
+/// Identifies an accepted operation until its [`Completion`] is delivered.
 pub type Ticket = u64;
 
-/// Tokens with this bit set are not batch writes (reclaim reads, fsync).
+/// Tokens with this bit set are auxiliary operations (headers, footers,
+/// fsync, reclaim reads), not batch writes.
 const AUX_TOKEN: u64 = 1 << 63;
 
 /// Options for a single `put`.
@@ -85,7 +108,7 @@ pub struct PutOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutOutcome {
     /// The record was accepted. It is durable and visible once the
-    /// [`Completion`] for `ticket` reports success (or after [`Writer::flush`]).
+    /// [`Completion`] for `ticket` reports success.
     Written {
         /// Identifies the eventual completion.
         ticket: Ticket,
@@ -96,15 +119,50 @@ pub enum PutOutcome {
     Exists,
 }
 
-/// The outcome of a write accepted earlier.
+/// Result of a `delete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// A tombstone was appended. The chunk is invisible to this writer at
+    /// once and to readers (and after a crash) once the completion for
+    /// `ticket` reports success.
+    Deleted {
+        /// Identifies the eventual completion.
+        ticket: Ticket,
+        /// The tombstone's LSN.
+        lsn: Lsn,
+    },
+    /// The chunk is neither indexed nor pending; nothing was written.
+    Missing,
+}
+
+/// What a completed ticket did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// A record is on disk and indexed.
+    Put {
+        /// The record's LSN.
+        lsn: Lsn,
+    },
+    /// A tombstone is on disk.
+    Delete {
+        /// The tombstone's LSN.
+        lsn: Lsn,
+    },
+    /// Every write accepted before the barrier is durable.
+    Flush,
+    /// As `Flush`, and both active segments are sealed.
+    Seal,
+    /// A reclaim pass finished.
+    Reclaim(ReclaimReport),
+}
+
+/// The outcome of an operation accepted earlier.
 #[derive(Debug)]
 pub struct Completion {
-    /// The ticket returned by `put`.
+    /// The ticket the operation returned.
     pub ticket: Ticket,
-    /// The record's LSN.
-    pub lsn: Lsn,
-    /// `Ok` once the record is on disk and indexed.
-    pub result: Result<()>,
+    /// What happened.
+    pub result: Result<Outcome>,
 }
 
 /// How reclaim decides what to keep when it processes a segment.
@@ -139,6 +197,8 @@ pub struct ReclaimReport {
     pub tombstones_dropped: u64,
     /// Value bytes copied.
     pub bytes_relocated: u64,
+    /// Data records whose value failed its checksums (counted in `dropped`).
+    pub corrupt: u64,
 }
 
 /// A pool buffer laid out as a large batch, with the value area exposed for
@@ -177,6 +237,10 @@ impl LargeValue {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Segments under construction
+// ---------------------------------------------------------------------------
+
 struct Active {
     seg_no: u32,
     seq: u64,
@@ -185,14 +249,23 @@ struct Active {
     tail: u64,
     /// Footer entries of every record applied so far.
     footer: Vec<FooterEntry>,
-    /// A write into this segment failed; it must be sealed at `tail` and
+    /// A write into this segment failed; it is truncated at `tail` and
     /// abandoned.
     broken: bool,
+    /// The header write that opened the segment has completed; batches may
+    /// go to the device.
+    opened: bool,
+    /// Batches closed for this segment and not yet applied, and the records
+    /// they hold: the footer must have room for them too.
+    unapplied: u32,
+    unapplied_records: usize,
 }
 
 impl Active {
     fn fits(&self, batch_len: u64, new_records: usize, segment_size: u64) -> bool {
-        !self.broken && self.tail + batch_len + footer_len(self.footer.len() + new_records) <= segment_size
+        !self.broken
+            && self.tail + batch_len + footer_len(self.footer.len() + self.unapplied_records + new_records)
+                <= segment_size
     }
 }
 
@@ -204,17 +277,12 @@ enum Apply {
     /// A record relocated by reclaim: only applies if the index still points
     /// at the old location.
     Relocate(Location),
-    /// No index change (tombstones; the index was updated at delete time).
-    None,
+    /// A tombstone: the index was updated at delete time.
+    Tombstone,
 }
 
 struct PendingRecord {
-    /// Offset of the record header from the start of the batch.
-    offset_in_batch: u32,
-    /// Offset of the value from the start of the batch.
-    value_in_batch: u32,
-    /// Footer entry with segment-relative offsets left at zero until the batch
-    /// position is known.
+    /// Offsets are batch-relative until `enqueue_batch` fixes the position.
     entry: FooterEntry,
     apply: Apply,
     ticket: Option<Ticket>,
@@ -235,7 +303,6 @@ struct Pending {
     header_len: usize,
     header_pos: usize,
     records: Vec<PendingRecord>,
-    keys: HashSet<ChunkId, ChunkIdHashBuilder>,
     first_lsn: Lsn,
 }
 
@@ -248,7 +315,6 @@ impl Pending {
             header_len: 0,
             header_pos: BATCH_HEADER_LEN,
             records: Vec::new(),
-            keys: HashSet::default(),
             first_lsn: 0,
         }
     }
@@ -323,11 +389,8 @@ impl Pending {
         if self.kind == BatchKind::Framed {
             self.header_pos = hdr_pos + meta;
         }
-        self.keys.insert(hdr.key);
         self.records.push(PendingRecord {
-            offset_in_batch: hdr_pos as u32,
-            value_in_batch: value_pos as u32,
-            entry: footer_entry(hdr, checksums),
+            entry: footer_entry(hdr, checksums, hdr_pos, value_pos),
             apply,
             ticket,
         });
@@ -360,11 +423,11 @@ impl Pending {
 }
 
 /// The footer entry for a record, with segment offsets still unresolved.
-fn footer_entry(hdr: &RecordHeader, checksums: &[u32]) -> FooterEntry {
+fn footer_entry(hdr: &RecordHeader, checksums: &[u32], offset: usize, value_off: usize) -> FooterEntry {
     FooterEntry {
         key: hdr.key,
-        offset: 0,
-        value_off: 0,
+        offset: offset as u32,
+        value_off: value_off as u32,
         value_len: hdr.value_len,
         lsn: hdr.lsn,
         crc: checksums.first().copied().unwrap_or(0),
@@ -373,58 +436,186 @@ fn footer_entry(hdr: &RecordHeader, checksums: &[u32]) -> FooterEntry {
     }
 }
 
-struct InFlight {
-    token: u64,
-    slot: usize,
+/// An encoded batch with its position fixed, waiting for the queue or in
+/// flight.
+struct Batch {
+    /// Close sequence number; barriers are expressed in terms of it.
+    id: u64,
     seg_no: u32,
     offset: u64,
-    batch_len: u64,
+    batch_len: usize,
     records: Vec<PendingRecord>,
+    /// The encoded bytes while the batch waits for the queue; `None` once the
+    /// queue holds them.
+    buf: Option<PooledBuf>,
+}
+
+struct InFlight {
+    batch: Batch,
+    token: u64,
     /// Set when the completion arrives; applied once every earlier batch has
     /// been applied.
     result: Option<io::Result<usize>>,
 }
 
-/// The single writer of an engine.
+// ---------------------------------------------------------------------------
+// Auxiliary operations and state machines
+// ---------------------------------------------------------------------------
+
+/// What an auxiliary I/O was for.
+#[derive(Debug, Clone, Copy)]
+enum Aux {
+    /// The header that opens a fresh active segment.
+    OpenHeader { seg_no: u32 },
+    /// One piece of a footer.
+    Footer { seg_no: u32 },
+    /// The header that marks a segment sealed.
+    SealHeader { seg_no: u32 },
+    /// A barrier's `fdatasync`.
+    Fsync { ticket: Ticket },
+    /// A reclaim window read.
+    ReclaimRead,
+    /// The header that returns a reclaimed segment to the free list.
+    FreeHeader { seg_no: u32 },
+}
+
+/// An auxiliary operation the queue had no room for yet.
+struct AuxOp {
+    aux: Aux,
+    buf: PooledBuf,
+    len: usize,
+    offset: u64,
+    read: bool,
+}
+
+enum SealStage {
+    /// Waiting for the segment's batches to be applied.
+    Draining,
+    /// Footer pieces being written.
+    Footer {
+        encoded: AlignedBuf,
+        written: usize,
+        outstanding: u32,
+    },
+    /// The sealed header write is in flight.
+    Header,
+}
+
+struct Sealing {
+    seg: Active,
+    stage: SealStage,
+}
+
+enum Fsync {
+    NotNeeded,
+    /// Batches are applied; the fsync has yet to be enqueued.
+    Pending,
+    Issued,
+    Done,
+}
+
+struct Barrier {
+    ticket: Ticket,
+    /// Complete once no batch with an id below this is unapplied.
+    until: u64,
+    /// Segments that must leave `sealing` (for `seal`).
+    seal: Option<Vec<u32>>,
+    fsync: Fsync,
+    error: Option<String>,
+}
+
+enum ReclaimStage {
+    /// Issue the next window read (or finish when the cursor reached the end).
+    Read,
+    /// A window read is in flight.
+    Reading,
+    /// A window is being processed; resume at batch `rel`, record `rec`.
+    Process {
+        buf: PooledBuf,
+        len: usize,
+        rel: usize,
+        rec: usize,
+    },
+    /// Every record is processed; waiting for the batches that carry the
+    /// relocations and the foreground writes the decisions relied on.
+    Drain,
+    /// Waiting for readers to release the victim.
+    Pins,
+    /// The free header write is in flight.
+    Freeing,
+}
+
+struct ReclaimJob {
+    ticket: Ticket,
+    seg_no: u32,
+    seq: u64,
+    kind: SegmentKind,
+    policy: ReclaimPolicy,
+    is_oldest: bool,
+    end: u64,
+    cursor: u64,
+    window: usize,
+    report: ReclaimReport,
+    stage: ReclaimStage,
+    drain_until: u64,
+    /// A relocation write failed; the victim must be kept.
+    failed: bool,
+}
+
+/// A data record appended but not yet applied.
+struct Unapplied {
+    count: u32,
+    max_lsn: Lsn,
+}
+
+/// A tombstone that still has to suppress older puts of its key.
+struct Tombstone {
+    lsn: Lsn,
+    /// The tombstone itself is on disk; the entry only lingers while puts of
+    /// the key with a lower LSN are unapplied.
+    applied: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Writer
+// ---------------------------------------------------------------------------
+
+/// The single writer of an engine: owns the log tails, assigns LSNs, performs
+/// every index mutation, seals segments and runs reclaim, all without blocking.
 ///
-/// Exactly one writer exists per open engine. It owns the log tail of the hot
-/// and cold active segments, assigns LSNs, performs every index mutation, seals
-/// segments and runs reclaim. It is `Send` but not `Sync`: drive it from one
-/// thread per disk.
-///
-/// # Durability and acknowledgement
-///
-/// `put` only enqueues. Values shorter than
-/// [`Options::pack_threshold`](crate::Options::pack_threshold) accumulate in a
-/// packed batch that is submitted once it reaches
-/// [`Options::batch_limit`](crate::Options::batch_limit); larger values are
-/// submitted immediately. A record is durable and visible to readers when its
-/// [`Completion`] arrives through [`Writer::poll`] with `Ok`, or after
-/// [`Writer::flush`] returns. Operations that need a consistent view
-/// (`delete`, `reclaim`, `seal_active`, `close`) flush internally.
+/// It is `Send` but not `Sync`: drive it from one thread, the one that owns
+/// the queue it was attached to.
 pub struct Writer {
     shared: Arc<Shared>,
-    queue: Box<dyn IoQueue>,
+    index: IndexWriter,
+    desc: Descriptor,
     active: [Option<Active>; 2],
     /// Pending packed batches per segment kind: `[inline, framed]`.
     pending: [[Pending; 2]; 2],
+    /// Closed batches waiting for queue room, per segment kind.
+    ready: [VecDeque<Batch>; 2],
     inflight: VecDeque<InFlight>,
-    /// Completed auxiliary operations (reclaim reads, fsync).
-    aux_done: HashMap<u64, IoCompletion>,
+    aux: HashMap<u64, (Aux, usize)>,
+    aux_ready: VecDeque<AuxOp>,
+    sealing: Vec<Sealing>,
+    barriers: VecDeque<Barrier>,
+    reclaim: Option<ReclaimJob>,
     completions: Vec<Completion>,
     scratch: Vec<IoCompletion>,
-    /// Keys of records submitted but not yet applied, with multiplicity.
-    inflight_keys: HashMap<ChunkId, u32, ChunkIdHashBuilder>,
+    /// Data records appended but not yet applied, per key.
+    unapplied: HashMap<ChunkId, Unapplied, ChunkIdHashBuilder>,
+    /// Tombstones that still outrank unapplied puts of their key.
+    deleted: HashMap<ChunkId, Tombstone, ChunkIdHashBuilder>,
     free: VecDeque<u32>,
-    /// Batch write tokens are consecutive, so a completion is located in
-    /// `inflight` by subtracting the front token.
+    /// Batch write tokens are consecutive in submission order, so a
+    /// completion is located in `inflight` by subtracting the front token.
     next_batch_token: u64,
+    next_batch_id: u64,
     next_aux_token: u64,
     next_ticket: Ticket,
     next_seq: u64,
     next_lsn: Lsn,
     max_batch: u64,
-    relocation_failures: u64,
 }
 
 fn slot(kind: SegmentKind) -> usize {
@@ -443,8 +634,8 @@ fn batch_slot(kind: BatchKind) -> usize {
 
 /// Chooses how a small (below the pack threshold) value is stored.
 fn small_batch_kind(value_len: u32, expire_at: u64) -> BatchKind {
-    // Framed records are verified from the index CRC without reading their
-    // header, which is where the expiry lives; expiring values stay inline.
+    // Expiring records always read their header for TTL; keep it adjacent to
+    // the value so those reads do not span a separate framed header area.
     if expire_at == 0 && prefer_framed(value_len) {
         BatchKind::Framed
     } else {
@@ -475,82 +666,118 @@ fn header(kind: RecordKind, flags: u8, value_len: u32, lsn: Lsn, key: ChunkId, e
     }
 }
 
+fn io_error(msg: impl Into<String>) -> Error {
+    Error::Io(io::Error::other(msg.into()))
+}
+
 impl Writer {
-    pub(crate) fn new(
-        shared: Arc<Shared>,
-        queue: Box<dyn IoQueue>,
-        free: VecDeque<u32>,
-        next_seq: u64,
-        next_lsn: Lsn,
-    ) -> Self {
+    pub(crate) fn new(shared: Arc<Shared>, desc: Descriptor) -> Self {
         let max_batch = max_batch_len(&shared);
+        let segments = &shared.segments;
+        let free: VecDeque<u32> = segments
+            .iter()
+            .filter(|&s| segments.state(s) == SegmentState::Free)
+            .collect();
+        let next_seq = shared.next_seq.load(Ordering::Acquire);
+        let next_lsn = shared.next_lsn.load(Ordering::Acquire);
         Self {
+            index: IndexWriter::new(shared.index.clone()),
             shared,
-            queue,
+            desc,
             active: [None, None],
             pending: [
                 [Pending::new(BatchKind::Inline), Pending::new(BatchKind::Framed)],
                 [Pending::new(BatchKind::Inline), Pending::new(BatchKind::Framed)],
             ],
+            ready: [VecDeque::new(), VecDeque::new()],
             inflight: VecDeque::new(),
-            aux_done: HashMap::new(),
+            aux: HashMap::new(),
+            aux_ready: VecDeque::new(),
+            sealing: Vec::new(),
+            barriers: VecDeque::new(),
+            reclaim: None,
             completions: Vec::new(),
             scratch: Vec::new(),
-            inflight_keys: HashMap::default(),
+            unapplied: HashMap::default(),
+            deleted: HashMap::default(),
             free,
             next_batch_token: 0,
+            next_batch_id: 1,
             next_aux_token: 0,
             next_ticket: 1,
             next_seq,
             next_lsn,
             max_batch,
-            relocation_failures: 0,
         }
     }
 
-    // -- public API ----------------------------------------------------------
+    // -- data ---------------------------------------------------------------
+
+    /// Hints the index location of an upcoming put or delete.
+    ///
+    /// Call this while processing an earlier request to overlap a cold index
+    /// lookup with useful work. It does not reserve a slot, perform I/O, or
+    /// change the result of any operation. Unsupported targets ignore it.
+    #[inline]
+    pub fn prefetch(&self, id: &ChunkId) {
+        self.index.prefetch(id);
+    }
 
     /// Appends a chunk, copying `value` into the log buffers.
     ///
     /// For values at or above the pack threshold, [`Writer::prepare_large`]
     /// followed by [`Writer::put_large`] avoids this copy.
-    pub fn put(&mut self, id: ChunkId, value: &[u8], opts: PutOptions) -> Result<PutOutcome> {
+    pub fn put(&mut self, q: &mut dyn IoQueue, id: ChunkId, value: &[u8], opts: PutOptions) -> Result<PutOutcome> {
         self.check_len(value.len() as u64)?;
         if self.exists(&id, opts) {
             return Ok(PutOutcome::Exists);
         }
-        let checksums = block_checksums(value);
+        self.check_index_room(&id)?;
+        // Small puts need at most one checksum; avoid a heap allocation for
+        // every packed record. Encoding consumes the slice before returning.
+        let single;
+        let multiple;
+        let checksums: &[u32] = if value.len() <= CHECKSUM_BLOCK_SIZE {
+            single = [crc32c(value)];
+            &single[..usize::from(!value.is_empty())]
+        } else {
+            multiple = block_checksums(value);
+            &multiple
+        };
         let len = value.len() as u32;
         if value.len() >= self.shared.options.pack_threshold as usize {
-            let mut large = self.prepare_large(len)?;
+            let mut large = self.prepare_large(q, len)?;
             large.value_mut().copy_from_slice(value);
+            self.ensure_room(q, SegmentKind::Hot, large_batch_len(len), 1)?;
             let (ticket, lsn) = self.next_ids();
             let flags = record_flags(BatchKind::Large, opts.expire_at);
             let hdr = header(RecordKind::Data, flags, len, lsn, id, opts.expire_at);
             self.write_large(
+                q,
                 SegmentKind::Hot,
                 &hdr,
-                &checksums,
+                checksums,
                 large.buf,
                 Apply::Insert,
                 Some(ticket),
-            )?;
+            );
             Ok(PutOutcome::Written { ticket, lsn })
         } else {
             let batch = small_batch_kind(len, opts.expire_at);
-            self.reserve_small(SegmentKind::Hot, batch, value.len())?;
+            self.reserve_small(q, SegmentKind::Hot, batch, value.len())?;
             let (ticket, lsn) = self.next_ids();
             let flags = record_flags(batch, opts.expire_at);
             let hdr = header(RecordKind::Data, flags, len, lsn, id, opts.expire_at);
             self.append_small(
+                q,
                 SegmentKind::Hot,
                 batch,
                 &hdr,
-                &checksums,
+                checksums,
                 value,
                 Apply::Insert,
                 Some(ticket),
-            )?;
+            );
             Ok(PutOutcome::Written { ticket, lsn })
         }
     }
@@ -558,21 +785,15 @@ impl Writer {
     /// Allocates a buffer for a value of `value_len` bytes laid out as a large
     /// batch, so the value can be produced in place and written without a
     /// copy. `value_len` must be at least the pack threshold.
-    pub fn prepare_large(&mut self, value_len: u32) -> Result<LargeValue> {
-        let max = self.shared.superblock.chunk_max;
-        if value_len > max {
-            return Err(Error::ValueTooLarge {
-                len: value_len as u64,
-                max: max as u64,
-            });
-        }
+    pub fn prepare_large(&mut self, q: &mut dyn IoQueue, value_len: u32) -> Result<LargeValue> {
+        self.check_len(value_len as u64)?;
         if value_len < self.shared.options.pack_threshold {
             return Err(Error::InvalidOption(format!(
                 "large values must be at least {} bytes",
                 self.shared.options.pack_threshold
             )));
         }
-        let buf = self.alloc(large_batch_len(value_len) as usize)?;
+        let buf = q.pool().alloc(large_batch_len(value_len) as usize).ok_or(Error::Busy)?;
         Ok(LargeValue {
             buf,
             value_len,
@@ -586,6 +807,7 @@ impl Writer {
     /// already has them (end-to-end integrity); they are computed otherwise.
     pub fn put_large(
         &mut self,
+        q: &mut dyn IoQueue,
         id: ChunkId,
         value: LargeValue,
         checksums: Option<&[u32]>,
@@ -595,149 +817,162 @@ impl Writer {
         if self.exists(&id, opts) {
             return Ok(PutOutcome::Exists);
         }
+        self.check_index_room(&id)?;
         let expected = block_count(value.len() as u64) as usize;
+        let computed;
         let checksums = match checksums {
-            Some(c) if c.len() == expected => c.to_vec(),
+            Some(c) if c.len() == expected => c,
             Some(c) => {
                 return Err(Error::InvalidOption(format!(
                     "expected {expected} block checksums, got {}",
                     c.len()
                 )));
             }
-            None => block_checksums(value.value()),
+            None => {
+                computed = block_checksums(value.value());
+                &computed
+            }
         };
+        self.ensure_room(q, SegmentKind::Hot, large_batch_len(value.len()), 1)?;
         let (ticket, lsn) = self.next_ids();
         let flags = record_flags(BatchKind::Large, opts.expire_at);
         let hdr = header(RecordKind::Data, flags, value.len(), lsn, id, opts.expire_at);
         self.write_large(
+            q,
             SegmentKind::Hot,
             &hdr,
-            &checksums,
+            checksums,
             value.buf,
             Apply::Insert,
             Some(ticket),
-        )?;
+        );
         Ok(PutOutcome::Written { ticket, lsn })
     }
 
-    /// Deletes a chunk. Returns whether it existed.
+    /// Deletes a chunk by appending a tombstone.
     ///
-    /// The deletion is durable when this returns: the index entry is removed
-    /// and a tombstone has been written so recovery cannot resurrect the
-    /// chunk.
-    pub fn delete(&mut self, id: &ChunkId) -> Result<bool> {
-        // Pending and in-flight puts of this key must be applied with their
-        // (older) LSNs before the tombstone takes a newer one.
-        self.flush_pending(SegmentKind::Hot)?;
-        self.wait_inflight()?;
-        let Some(old) = self.shared.index.remove(id) else {
-            return Ok(false);
-        };
-        self.shared.segments.sub_live(
-            old.loc.seg_no,
-            RecordGeometry::footprint(old.value_len, old.record_flags()),
-        );
-        self.reserve_small(SegmentKind::Hot, BatchKind::Inline, 0)?;
-        let lsn = self.take_lsn();
+    /// The chunk disappears from this writer's view at once (a subsequent put
+    /// of the id is not `Exists`) and from readers' when the completion
+    /// reports success, at which point the deletion also survives a crash.
+    pub fn delete(&mut self, q: &mut dyn IoQueue, id: &ChunkId) -> Result<DeleteOutcome> {
+        if !self.exists(id, PutOptions::default()) {
+            return Ok(DeleteOutcome::Missing);
+        }
+        self.reserve_small(q, SegmentKind::Hot, BatchKind::Inline, 0)?;
+        if let Some(old) = self.index.remove(id) {
+            self.shared.segments.sub_live(
+                old.loc.seg_no,
+                RecordGeometry::footprint(old.value_len, old.record_flags()),
+            );
+        }
+        let (ticket, lsn) = self.next_ids();
+        self.deleted.insert(*id, Tombstone { lsn, applied: false });
         let hdr = header(RecordKind::Tombstone, 0, 0, lsn, *id, 0);
-        self.append_small(SegmentKind::Hot, BatchKind::Inline, &hdr, &[], &[], Apply::None, None)?;
-        self.flush_pending(SegmentKind::Hot)?;
-        self.wait_inflight()?;
-        Ok(true)
+        self.append_small(
+            q,
+            SegmentKind::Hot,
+            BatchKind::Inline,
+            &hdr,
+            &[],
+            &[],
+            Apply::Tombstone,
+            Some(ticket),
+        );
+        Ok(DeleteOutcome::Deleted { ticket, lsn })
     }
 
-    /// Pushes queued I/O to the device without waiting for anything.
-    pub fn submit(&mut self) -> Result<()> {
-        self.queue.submit()?;
-        Ok(())
+    // -- control ------------------------------------------------------------
+
+    /// Barrier: its completion reports [`Outcome::Flush`] once every write
+    /// accepted before it is durable (including an `fdatasync` when
+    /// [`Options::sync_on_flush`](crate::Options::sync_on_flush) is set), or
+    /// the first error among those writes.
+    pub fn flush(&mut self, q: &mut dyn IoQueue) -> Result<Ticket> {
+        self.close_all_pending(q)?;
+        Ok(self.enqueue_barrier(q, None))
     }
 
-    /// Reaps I/O completions, applies them in order, and appends the resulting
-    /// [`Completion`]s to `out`. With `wait` set and writes in flight, blocks
-    /// until at least one completes. Returns the number appended.
-    pub fn poll(&mut self, out: &mut Vec<Completion>, wait: bool) -> Result<usize> {
-        self.poll_io(wait)?;
-        let n = self.completions.len();
-        out.append(&mut self.completions);
-        Ok(n)
-    }
-
-    /// Writes every pending batch and waits for all in-flight writes.
+    /// `flush`, then seal both active segments so the next open needs no
+    /// scan. The completion reports [`Outcome::Seal`].
     ///
-    /// Afterwards every previous put is durable and visible. Completions
-    /// produced meanwhile are discarded (use [`Writer::poll`] to observe them);
-    /// the first failure, if any, is returned.
-    pub fn flush(&mut self) -> Result<()> {
-        self.flush_pending(SegmentKind::Hot)?;
-        self.flush_pending(SegmentKind::Cold)?;
-        self.wait_inflight()?;
-        if self.shared.options.sync_on_flush {
-            let token = self.next_aux_token();
-            self.queue.fsync(token)?;
-            let done = self.wait_aux(token)?;
-            done.result?;
-        }
-        let first_err = self.completions.drain(..).find_map(|c| c.result.err());
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-
-    /// Flushes and seals both active segments.
-    ///
-    /// Sealed segments are described by a footer (fast recovery) and become
-    /// eligible for reclaim. The writer allocates fresh segments on the next
-    /// write, so sealing a nearly empty segment wastes its remaining space;
-    /// callers normally leave sealing to the writer and use this only before
-    /// shutdown or when reclaim must be able to reach recent data.
-    pub fn seal_active(&mut self) -> Result<()> {
-        self.flush()?;
-        for kind in [SegmentKind::Hot, SegmentKind::Cold] {
-            if let Some(active) = self.active[slot(kind)].take() {
-                self.seal(active)?;
+    /// The writer allocates fresh segments on the next write, so sealing a
+    /// nearly empty segment wastes its remaining space; callers normally leave
+    /// sealing to the writer and use this before shutdown or when reclaim must
+    /// be able to reach recent data.
+    pub fn seal(&mut self, q: &mut dyn IoQueue) -> Result<Ticket> {
+        self.close_all_pending(q)?;
+        let mut sealed = Vec::new();
+        for k in 0..2 {
+            if let Some(active) = self.active[k].take() {
+                sealed.push(active.seg_no);
+                self.park(active);
             }
         }
-        Ok(())
+        Ok(self.enqueue_barrier(q, Some(sealed)))
     }
 
-    /// Flushes and seals the active segments so the next open needs no scan.
+    fn enqueue_barrier(&mut self, q: &mut dyn IoQueue, seal: Option<Vec<u32>>) -> Ticket {
+        let ticket = self.next_ticket();
+        self.barriers.push_back(Barrier {
+            ticket,
+            until: self.next_batch_id,
+            seal,
+            fsync: if self.shared.options.sync_on_flush {
+                Fsync::Pending
+            } else {
+                Fsync::NotNeeded
+            },
+            error: None,
+        });
+        self.push_ready(q);
+        ticket
+    }
+
+    /// Starts one reclaim pass under `policy`; the completion reports
+    /// [`Outcome::Reclaim`]. `None` if there is no sealed segment to reclaim,
+    /// [`Error::Busy`] while a previous pass is still running.
     ///
-    /// Dropping a writer without closing is safe; recovery scans whatever was
-    /// left active.
-    pub fn close(mut self) -> Result<()> {
-        self.seal_active()
-    }
-
-    /// Number of free segments.
-    pub fn free_segments(&self) -> u32 {
-        self.free.len() as u32
-    }
-
-    /// The LSN the next record will receive.
-    pub fn next_lsn(&self) -> Lsn {
-        self.next_lsn
-    }
-
-    /// Batches submitted but not yet applied.
-    pub fn in_flight(&self) -> usize {
-        self.inflight.len()
-    }
-
-    /// Runs one reclaim pass under `policy`.
-    ///
-    /// Picks a victim among the sealed segments, relocates what the policy
-    /// keeps, and frees the segment. Returns `None` if there is no sealed
-    /// segment to reclaim.
-    ///
-    /// Relocation needs a free segment for the cold log; callers should reclaim
-    /// before the free list is exhausted (keeping at least two free segments is
-    /// enough).
-    pub fn reclaim(&mut self, policy: ReclaimPolicy) -> Result<Option<ReclaimReport>> {
-        let Some(victim) = self.pick_victim(policy) else {
+    /// Relocation needs a free segment for the cold log; callers should
+    /// reclaim before the free list is exhausted (keeping at least two free
+    /// segments is enough).
+    pub fn reclaim(&mut self, q: &mut dyn IoQueue, policy: ReclaimPolicy) -> Result<Option<Ticket>> {
+        if self.reclaim.is_some() {
+            return Err(Error::Busy);
+        }
+        let Some(seg_no) = self.pick_victim(policy) else {
             return Ok(None);
         };
-        self.reclaim_segment(victim, policy).map(Some)
+        let (seq, kind, end) = {
+            let segments = &self.shared.segments;
+            (segments.seq(seg_no), segments.kind(seg_no), segments.data_end(seg_no))
+        };
+        let is_oldest = self.oldest_live_seq() == Some(seq);
+        // The window is a performance knob; it is bounded by the pool's
+        // largest class but never below the largest batch.
+        let window = align_up(self.shared.options.scan_window as u64, PAGE_SIZE)
+            .min(q.pool().max_class() as u64)
+            .max(self.max_batch) as usize;
+        let ticket = self.next_ticket();
+        self.reclaim = Some(ReclaimJob {
+            ticket,
+            seg_no,
+            seq,
+            kind,
+            policy,
+            is_oldest,
+            end,
+            cursor: self.shared.geometry.data_start(),
+            window,
+            report: ReclaimReport {
+                seg_no,
+                ..Default::default()
+            },
+            stage: ReclaimStage::Read,
+            drain_until: 0,
+            failed: false,
+        });
+        self.advance_reclaim(q);
+        Ok(Some(ticket))
     }
 
     /// Chooses the segment [`Writer::reclaim`] would process next.
@@ -752,6 +987,87 @@ impl Writer {
             })
     }
 
+    // -- progress -----------------------------------------------------------
+
+    /// Applies completions that arrived for this writer, advances the sealing,
+    /// barrier and reclaim state machines, submits whatever became ready
+    /// (including any partially filled pending batch), and appends the
+    /// resulting [`Completion`]s to `out`. Never waits. Returns the number
+    /// appended.
+    pub fn poll(&mut self, q: &mut dyn IoQueue, out: &mut Vec<Completion>) -> Result<usize> {
+        self.scratch.clear();
+        q.take(self.desc, &mut self.scratch);
+        let mut finished = std::mem::take(&mut self.scratch);
+        for done in finished.drain(..) {
+            if done.token & AUX_TOKEN != 0 {
+                if let Some((aux, len)) = self.aux.remove(&done.token) {
+                    self.finish_aux(aux, len, done);
+                }
+            } else if let Some(front) = self.inflight.front() {
+                let index = (done.token - front.token) as usize;
+                // The buffer returns to the pool when `done` is dropped here.
+                self.inflight[index].result = Some(done.result);
+            }
+        }
+        self.scratch = finished;
+        while self.inflight.front().is_some_and(|f| f.result.is_some()) {
+            let mut front = self.inflight.pop_front().expect("front exists");
+            let result = front.result.take().expect("checked");
+            self.apply_batch(front.batch, result);
+        }
+
+        self.advance_sealing(q);
+        self.advance_barriers(q);
+        self.advance_reclaim(q);
+        self.index.gc();
+
+        // Close whatever accumulated during this iteration; a packing window
+        // is one worker iteration. A batch that cannot be placed yet stays
+        // pending until the next poll.
+        let _ = self.close_all_pending(q);
+        self.push_ready(q);
+
+        let n = self.completions.len();
+        out.append(&mut self.completions);
+        Ok(n)
+    }
+
+    /// Batches and auxiliary operations accepted but not yet completed.
+    pub fn in_flight(&self) -> usize {
+        self.inflight.len()
+            + self.ready.iter().map(VecDeque::len).sum::<usize>()
+            + self.aux.len()
+            + self.aux_ready.len()
+    }
+
+    /// Whether nothing is pending: no unwritten records, no I/O in flight, no
+    /// sealing, barrier or reclaim in progress. Safe to `detach` when true.
+    pub fn is_idle(&self) -> bool {
+        self.in_flight() == 0
+            && self.pending.iter().all(|p| p.iter().all(Pending::is_empty))
+            && self.sealing.is_empty()
+            && self.barriers.is_empty()
+            && self.reclaim.is_none()
+    }
+
+    /// Number of free segments.
+    pub fn free_segments(&self) -> u32 {
+        self.free.len() as u32
+    }
+
+    /// The LSN the next record will receive.
+    pub fn next_lsn(&self) -> Lsn {
+        self.next_lsn
+    }
+
+    /// Closes the descriptor. Call after `seal` has completed and
+    /// [`Writer::is_idle`] is true; otherwise in-flight batches are abandoned
+    /// (recovery handles that, but the segment is scanned on next open).
+    pub fn detach(self, q: &mut dyn IoQueue) {
+        q.detach(self.desc);
+        drop(self);
+    }
+
     // -- helpers -------------------------------------------------------------
 
     fn check_len(&self, len: u64) -> Result<()> {
@@ -762,17 +1078,34 @@ impl Writer {
         Ok(())
     }
 
+    /// A put of a key the index does not hold needs an index slot.
+    fn check_index_room(&self, id: &ChunkId) -> Result<()> {
+        if self.index.is_full() && self.index.get(id).is_none() {
+            return Err(Error::IndexFull);
+        }
+        Ok(())
+    }
+
     fn exists(&self, id: &ChunkId, opts: PutOptions) -> bool {
-        !opts.overwrite
-            && (self.shared.index.get(id).is_some()
-                || self.pending[slot(SegmentKind::Hot)].iter().any(|p| p.keys.contains(id))
-                || self.inflight_keys.contains_key(id))
+        if opts.overwrite {
+            return false;
+        }
+        if self.index.get(id).is_some() {
+            return true;
+        }
+        let deleted_at = self.deleted.get(id).map_or(0, |t| t.lsn);
+        self.unapplied.get(id).is_some_and(|u| u.max_lsn > deleted_at)
     }
 
     fn next_ids(&mut self) -> (Ticket, Lsn) {
+        let ticket = self.next_ticket();
+        (ticket, self.take_lsn())
+    }
+
+    fn next_ticket(&mut self) -> Ticket {
         let ticket = self.next_ticket;
         self.next_ticket += 1;
-        (ticket, self.take_lsn())
+        ticket
     }
 
     fn take_lsn(&mut self) -> Lsn {
@@ -787,35 +1120,55 @@ impl Writer {
         t | AUX_TOKEN
     }
 
-    /// Allocates from the queue's pool, waiting for in-flight I/O to return
-    /// buffers if necessary. Fails with [`Error::Busy`] only when nothing is
-    /// in flight to wait for.
-    fn alloc(&mut self, len: usize) -> Result<PooledBuf> {
-        loop {
-            if let Some(buf) = self.queue.pool().alloc(len) {
-                return Ok(buf);
-            }
-            if self.queue.in_flight() == 0 {
-                return Err(Error::Busy);
-            }
-            self.poll_io(true)?;
+    fn complete(&mut self, ticket: Ticket, result: Result<Outcome>) {
+        self.completions.push(Completion { ticket, result });
+    }
+
+    /// The segment record for `seg_no`, whether active or being sealed.
+    fn segment_mut(&mut self, seg_no: u32) -> Option<&mut Active> {
+        if let Some(a) = self.active.iter_mut().flatten().find(|a| a.seg_no == seg_no) {
+            return Some(a);
         }
+        self.sealing.iter_mut().map(|s| &mut s.seg).find(|s| s.seg_no == seg_no)
+    }
+
+    fn segment(&self, seg_no: u32) -> Option<&Active> {
+        if let Some(a) = self.active.iter().flatten().find(|a| a.seg_no == seg_no) {
+            return Some(a);
+        }
+        self.sealing.iter().map(|s| &s.seg).find(|s| s.seg_no == seg_no)
+    }
+
+    /// The lowest id among batches not yet applied, if any.
+    fn oldest_unapplied(&self) -> Option<u64> {
+        self.ready
+            .iter()
+            .filter_map(|r| r.front().map(|b| b.id))
+            .chain(self.inflight.iter().map(|f| f.batch.id))
+            .min()
     }
 
     // -- append path ---------------------------------------------------------
 
     /// Makes sure the pending batch of `(kind, batch)` can take a record with a
-    /// value of `value_len` bytes, flushing it and allocating a fresh staging
-    /// buffer as needed.
-    fn reserve_small(&mut self, kind: SegmentKind, batch: BatchKind, value_len: usize) -> Result<()> {
+    /// value of `value_len` bytes, closing it when full and attaching a fresh
+    /// staging buffer. A pending batch is placed in a segment only when it is
+    /// closed, so building one needs no segment room.
+    fn reserve_small(
+        &mut self,
+        q: &mut dyn IoQueue,
+        kind: SegmentKind,
+        batch: BatchKind,
+        value_len: usize,
+    ) -> Result<()> {
         let (k, b) = (slot(kind), batch_slot(batch));
         let meta = record_meta_len(value_len as u32);
         let limit = self.shared.options.batch_limit;
         if self.pending[k][b].buf.is_some() && !self.pending[k][b].fits(meta, value_len) {
-            self.flush_pending_kind(kind, batch)?;
+            self.close_pending(q, k, b)?;
         }
         if self.pending[k][b].buf.is_none() {
-            let buf = self.alloc(limit)?;
+            let buf = q.pool().alloc(limit).ok_or(Error::Busy)?;
             self.pending[k][b].attach(buf);
         }
         debug_assert!(self.pending[k][b].fits(meta, value_len));
@@ -825,6 +1178,7 @@ impl Writer {
     #[allow(clippy::too_many_arguments)]
     fn append_small(
         &mut self,
+        q: &mut dyn IoQueue,
         kind: SegmentKind,
         batch: BatchKind,
         hdr: &RecordHeader,
@@ -832,24 +1186,43 @@ impl Writer {
         value: &[u8],
         apply: Apply,
         ticket: Option<Ticket>,
-    ) -> Result<()> {
+    ) {
         let (k, b) = (slot(kind), batch_slot(batch));
+        self.track(hdr, apply);
         self.pending[k][b].append(hdr, checksums, value, apply, ticket);
         if self.pending[k][b].len >= self.shared.options.batch_limit {
-            self.flush_pending_kind(kind, batch)?;
+            // A batch that cannot be placed now (no free segment, no buffer
+            // for a segment header) stays pending and is retried by `poll`.
+            if self.close_pending(q, k, b).is_ok() {
+                self.push_ready(q);
+            }
         }
-        Ok(())
     }
 
+    fn track(&mut self, hdr: &RecordHeader, apply: Apply) {
+        if matches!(apply, Apply::Insert) {
+            let u = self
+                .unapplied
+                .entry(hdr.key)
+                .or_insert(Unapplied { count: 0, max_lsn: 0 });
+            u.count += 1;
+            u.max_lsn = u.max_lsn.max(hdr.lsn);
+        }
+    }
+
+    /// Encodes a large batch and queues it. The caller has reserved room with
+    /// `ensure_room`.
+    #[allow(clippy::too_many_arguments)]
     fn write_large(
         &mut self,
+        q: &mut dyn IoQueue,
         kind: SegmentKind,
         hdr: &RecordHeader,
         checksums: &[u32],
         mut buf: PooledBuf,
         apply: Apply,
         ticket: Option<Ticket>,
-    ) -> Result<()> {
+    ) {
         let batch_len = large_batch_len(hdr.value_len) as usize;
         let value_off = large_value_offset(hdr.value_len) as usize;
         let meta = hdr.meta_len();
@@ -859,9 +1232,10 @@ impl Writer {
         buf[BATCH_HEADER_LEN + meta..value_off].fill(0);
         buf[value_off + hdr.value_len as usize..batch_len].fill(0);
 
-        let active = self.ensure_room(kind, batch_len as u64, 1)?;
+        let active = self.active[slot(kind)].as_ref().expect("room ensured");
+        let (seg_no, seq) = (active.seg_no, active.seq);
         BatchHeader {
-            seg_seq: active.seq,
+            seg_seq: seq,
             batch_len: batch_len as u32,
             record_count: 1,
             first_lsn: hdr.lsn,
@@ -869,239 +1243,471 @@ impl Writer {
             header_len: 0,
         }
         .encode(&mut buf[..BATCH_HEADER_LEN]);
+        self.track(hdr, apply);
         let record = PendingRecord {
-            offset_in_batch: BATCH_HEADER_LEN as u32,
-            value_in_batch: value_off as u32,
-            entry: footer_entry(hdr, checksums),
+            entry: footer_entry(hdr, checksums, BATCH_HEADER_LEN, value_off),
             apply,
             ticket,
         };
-        self.submit_batch(kind, buf, batch_len, vec![record])
+        self.enqueue_batch(slot(kind), seg_no, buf, batch_len, vec![record]);
+        self.push_ready(q);
     }
 
-    /// Flushes both pending packed batches of `kind`.
-    fn flush_pending(&mut self, kind: SegmentKind) -> Result<()> {
-        self.flush_pending_kind(kind, BatchKind::Inline)?;
-        self.flush_pending_kind(kind, BatchKind::Framed)
+    /// Closes every non-empty pending batch. A batch that cannot be placed
+    /// (no free segment, no buffer for a segment header) stays pending; the
+    /// first such error is returned after the others were tried.
+    fn close_all_pending(&mut self, q: &mut dyn IoQueue) -> Result<()> {
+        let mut first = Ok(());
+        for k in 0..2 {
+            for b in 0..2 {
+                if let Err(e) = self.close_pending(q, k, b)
+                    && first.is_ok()
+                {
+                    first = Err(e);
+                }
+            }
+        }
+        first
     }
 
-    fn flush_pending_kind(&mut self, kind: SegmentKind, batch: BatchKind) -> Result<()> {
-        let (k, b) = (slot(kind), batch_slot(batch));
+    /// Closes the pending batch `(k, b)` into the ready queue at the tail of
+    /// the active segment of its kind.
+    fn close_pending(&mut self, q: &mut dyn IoQueue, k: usize, b: usize) -> Result<()> {
         if self.pending[k][b].is_empty() {
             return Ok(());
         }
+        let kind = if k == 0 { SegmentKind::Hot } else { SegmentKind::Cold };
         let n = self.pending[k][b].records.len();
         let batch_len = align_up(self.pending[k][b].len as u64, PAGE_SIZE);
-        let seq = self.ensure_room(kind, batch_len, n)?.seq;
-
-        let mut pending = std::mem::replace(&mut self.pending[k][b], Pending::new(batch));
+        self.ensure_room(q, kind, batch_len, n)?;
+        let active = self.active[k].as_ref().expect("room ensured");
+        let (seg_no, seq) = (active.seg_no, active.seq);
+        let batch_kind = self.pending[k][b].kind;
+        let mut pending = std::mem::replace(&mut self.pending[k][b], Pending::new(batch_kind));
         let batch_len = pending.finish(seq);
         let buf = pending.buf.take().expect("non-empty pending has a buffer");
-        self.submit_batch(kind, buf, batch_len, pending.records)
+        self.enqueue_batch(k, seg_no, buf, batch_len, pending.records);
+        Ok(())
     }
 
-    /// Submits a fully encoded batch at the tail of the active segment of
-    /// `kind` (which the caller has already sized with `ensure_room`).
-    fn submit_batch(
+    /// Fixes a fully encoded batch at the tail of `seg_no` and appends it to
+    /// the ready queue of kind `k`.
+    fn enqueue_batch(
         &mut self,
-        kind: SegmentKind,
+        k: usize,
+        seg_no: u32,
         buf: PooledBuf,
         batch_len: usize,
-        records: Vec<PendingRecord>,
-    ) -> Result<()> {
-        let k = slot(kind);
-        let active = self.active[k]
-            .as_mut()
-            .expect("ensure_room allocated an active segment");
-        let (seg_no, offset) = (active.seg_no, active.tail);
-        active.tail += batch_len as u64;
-
-        while self.queue.in_flight() >= self.queue.depth() {
-            self.poll_io(true)?;
+        mut records: Vec<PendingRecord>,
+    ) {
+        let seg = self.segment_mut(seg_no).expect("segment exists");
+        let offset = seg.tail;
+        for rec in &mut records {
+            rec.entry.offset += offset as u32;
+            rec.entry.value_off += offset as u32;
         }
-        let token = self.next_batch_token;
-        self.next_batch_token += 1;
-        let device_offset = self.shared.geometry.segment_offset(seg_no) + offset;
-        self.queue.write(buf, batch_len, device_offset, token)?;
-        for rec in &records {
-            *self.inflight_keys.entry(rec.entry.key).or_insert(0) += 1;
-        }
-        self.inflight.push_back(InFlight {
-            token,
-            slot: k,
+        seg.tail += batch_len as u64;
+        seg.unapplied += 1;
+        seg.unapplied_records += records.len();
+        let id = self.next_batch_id;
+        self.next_batch_id += 1;
+        self.ready[k].push_back(Batch {
+            id,
             seg_no,
             offset,
-            batch_len: batch_len as u64,
+            batch_len,
             records,
-            result: None,
+            buf: Some(buf),
         });
-        Ok(())
+    }
+
+    /// Pushes deferred auxiliary operations and ready batches (foreground
+    /// first) while the queue has room.
+    fn push_ready(&mut self, q: &mut dyn IoQueue) {
+        // Auxiliary operations first: segment headers gate the batches behind
+        // them, footers and free headers gate reclaim.
+        while q.vacant() > 0 {
+            let Some(op) = self.aux_ready.pop_front() else {
+                break;
+            };
+            if let Some(op) = self.try_enqueue_aux(q, op) {
+                self.aux_ready.push_front(op);
+                break;
+            }
+        }
+        for k in 0..2 {
+            while let Some(front) = self.ready[k].front() {
+                let seg_no = front.seg_no;
+                let seg = self.segment(seg_no).expect("ready batch for a known segment");
+                if seg.broken {
+                    // Everything from the failure onwards in this segment is
+                    // lost; nothing beyond the truncated tail is written.
+                    let batch = self.ready[k].pop_front().expect("front exists");
+                    let seg = self.segment_mut(seg_no).expect("known segment");
+                    seg.unapplied -= 1;
+                    seg.unapplied_records -= batch.records.len();
+                    self.fail_batch(batch, "write after a failed write in the same segment");
+                    continue;
+                }
+                if !seg.opened || q.vacant() == 0 {
+                    break;
+                }
+                let mut batch = self.ready[k].pop_front().expect("front exists");
+                let buf = batch.buf.take().expect("ready batch holds its buffer");
+                let token = self.next_batch_token;
+                let device_offset = self.shared.geometry.segment_offset(batch.seg_no) + batch.offset;
+                match q.write(self.desc, buf, batch.batch_len, device_offset, token) {
+                    Ok(()) => {
+                        self.next_batch_token += 1;
+                        self.inflight.push_back(InFlight {
+                            batch,
+                            token,
+                            result: None,
+                        });
+                    }
+                    Err(buf) => {
+                        batch.buf = Some(buf);
+                        self.ready[k].push_front(batch);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     // -- completion path -----------------------------------------------------
 
-    /// Reaps completions and applies every write whose turn has come.
-    fn poll_io(&mut self, wait: bool) -> Result<()> {
-        self.scratch.clear();
-        self.queue.poll(&mut self.scratch, wait)?;
-        for done in self.scratch.drain(..) {
-            if done.token & AUX_TOKEN != 0 {
-                self.aux_done.insert(done.token, done);
-            } else {
-                let front = self.inflight.front().expect("completion for an in-flight batch").token;
-                let index = (done.token - front) as usize;
-                // The buffer returns to the pool when `done` is dropped here.
-                self.inflight[index].result = Some(done.result);
-            }
-        }
-        while self.inflight.front().is_some_and(|f| f.result.is_some()) {
-            let mut batch = self.inflight.pop_front().expect("front exists");
-            let result = batch.result.take().expect("checked");
-            self.apply_batch(batch, result);
-        }
-        Ok(())
-    }
-
-    fn apply_batch(&mut self, batch: InFlight, result: io::Result<usize>) {
-        for rec in &batch.records {
-            if let Some(n) = self.inflight_keys.get_mut(&rec.entry.key) {
-                *n -= 1;
-                if *n == 0 {
-                    self.inflight_keys.remove(&rec.entry.key);
-                }
-            }
-        }
-        let active = self.active[batch.slot]
-            .as_mut()
-            .expect("active segment outlives its in-flight batches");
-        debug_assert_eq!(active.seg_no, batch.seg_no);
+    fn apply_batch(&mut self, batch: Batch, result: io::Result<usize>) {
         let failure = match result {
-            Ok(n) if n as u64 == batch.batch_len => None,
+            Ok(n) if n == batch.batch_len => None,
             Ok(n) => Some(format!("short write: {n} of {} bytes", batch.batch_len)),
             Err(e) => Some(e.to_string()),
         };
-        if failure.is_none() && !active.broken {
+        let seg_no = batch.seg_no;
+        let broken = {
+            let seg = self.segment_mut(seg_no).expect("segment outlives its batches");
+            seg.unapplied -= 1;
+            seg.unapplied_records -= batch.records.len();
+            seg.broken
+        };
+        if failure.is_none() && !broken {
+            self.segment_mut(seg_no)
+                .expect("segment outlives its batches")
+                .footer
+                .extend(batch.records.iter().map(|rec| rec.entry));
             for rec in batch.records {
-                let mut entry = rec.entry;
-                entry.offset = (batch.offset + rec.offset_in_batch as u64) as u32;
-                entry.value_off = (batch.offset + rec.value_in_batch as u64) as u32;
-                active.footer.push(entry);
-                // A relocation that no longer applies was superseded by a
-                // foreground write meanwhile; that is not a failure.
-                apply_record(&self.shared, batch.seg_no, &entry, rec.apply);
+                let entry = rec.entry;
+                let result = self.apply_record(seg_no, &entry, rec.apply);
                 if let Some(ticket) = rec.ticket {
-                    self.completions.push(Completion {
-                        ticket,
-                        lsn: entry.lsn,
-                        result: Ok(()),
-                    });
+                    let outcome = match rec.apply {
+                        Apply::Tombstone => Outcome::Delete { lsn: entry.lsn },
+                        _ => Outcome::Put { lsn: entry.lsn },
+                    };
+                    self.complete(ticket, result.map(|()| outcome));
                 }
             }
             return;
         }
-
         // Everything from the first failure onwards in this segment is lost;
         // truncate the segment there and abandon it.
-        if !active.broken {
-            active.broken = true;
-            active.tail = batch.offset;
+        let seg = self.segment_mut(seg_no).expect("segment outlives its batches");
+        if !seg.broken {
+            seg.broken = true;
+            seg.tail = batch.offset;
         }
         let message = failure.unwrap_or_else(|| "write after a failed write in the same segment".to_string());
+        self.fail_batch(batch, &message);
+    }
+
+    fn fail_batch(&mut self, batch: Batch, message: &str) {
         for rec in batch.records {
-            if matches!(rec.apply, Apply::Relocate(_)) {
-                self.relocation_failures += 1;
+            self.untrack(&rec.entry, rec.apply);
+            if matches!(rec.apply, Apply::Relocate(_))
+                && let Some(job) = &mut self.reclaim
+            {
+                job.failed = true;
             }
             if let Some(ticket) = rec.ticket {
-                self.completions.push(Completion {
-                    ticket,
-                    lsn: rec.entry.lsn,
-                    result: Err(Error::Io(io::Error::other(message.clone()))),
-                });
+                self.complete(ticket, Err(io_error(message)));
             }
+        }
+        for b in &mut self.barriers {
+            b.error.get_or_insert_with(|| message.to_string());
         }
     }
 
-    fn wait_inflight(&mut self) -> Result<()> {
-        while !self.inflight.is_empty() {
-            self.poll_io(true)?;
+    fn untrack(&mut self, entry: &FooterEntry, apply: Apply) {
+        match apply {
+            Apply::Insert => {
+                if let Some(u) = self.unapplied.get_mut(&entry.key) {
+                    u.count -= 1;
+                    if u.count == 0 {
+                        self.unapplied.remove(&entry.key);
+                        // No put of the key is unapplied any more; an applied
+                        // tombstone has nothing left to suppress.
+                        if self.deleted.get(&entry.key).is_some_and(|t| t.applied) {
+                            self.deleted.remove(&entry.key);
+                        }
+                    }
+                }
+            }
+            Apply::Tombstone => {
+                if let Some(t) = self.deleted.get_mut(&entry.key)
+                    && t.lsn == entry.lsn
+                {
+                    if self.unapplied.contains_key(&entry.key) {
+                        t.applied = true;
+                    } else {
+                        self.deleted.remove(&entry.key);
+                    }
+                }
+            }
+            Apply::Relocate(_) => {}
         }
+    }
+
+    /// Updates the index and live-byte accounting for a record now on disk.
+    fn apply_record(&mut self, seg_no: u32, entry: &FooterEntry, apply: Apply) -> Result<()> {
+        let footprint = RecordGeometry::footprint(entry.value_len, entry.flags);
+        let value = IndexValue {
+            loc: Location {
+                seg_no,
+                offset: entry.offset,
+            },
+            value_off: entry.value_off,
+            value_len: entry.value_len,
+            flags: flags_from_record(entry.flags),
+            lsn: entry.lsn,
+        };
+        let segments = &self.shared.segments;
+        let mut result = Ok(());
+        match apply {
+            Apply::Insert => {
+                // A tombstone appended after this record (and not yet applied)
+                // supersedes it: the record is on disk but never indexed.
+                let superseded = self.deleted.get(&entry.key).is_some_and(|t| t.lsn > entry.lsn);
+                if !superseded {
+                    match self.index.insert_if_newer(entry.key, value) {
+                        InsertOutcome::Inserted => segments.add_live(seg_no, footprint),
+                        InsertOutcome::Replaced(old) => {
+                            segments.sub_live(
+                                old.loc.seg_no,
+                                RecordGeometry::footprint(old.value_len, old.record_flags()),
+                            );
+                            segments.add_live(seg_no, footprint);
+                        }
+                        // An even newer version was applied first.
+                        InsertOutcome::Rejected => {}
+                        // The budget was checked at put time; a rebuild that
+                        // failed meanwhile leaves the record unindexed.
+                        InsertOutcome::Full => result = Err(Error::IndexFull),
+                    }
+                }
+            }
+            Apply::Relocate(from) => {
+                // A relocation that no longer applies was superseded by a
+                // foreground write meanwhile; that is not a failure.
+                if self.index.replace_if_at(&entry.key, from, value) {
+                    segments.add_live(seg_no, footprint);
+                }
+            }
+            Apply::Tombstone => {}
+        }
+        self.untrack(entry, apply);
+        result
+    }
+
+    // -- auxiliary I/O --------------------------------------------------------
+
+    /// Enqueues an auxiliary operation now, or defers it until the queue has
+    /// room.
+    fn enqueue_aux(&mut self, q: &mut dyn IoQueue, op: AuxOp) {
+        if let Some(op) = self.try_enqueue_aux(q, op) {
+            self.aux_ready.push_back(op);
+        }
+    }
+
+    fn try_enqueue_aux(&mut self, q: &mut dyn IoQueue, op: AuxOp) -> Option<AuxOp> {
+        let token = self.next_aux_token();
+        let AuxOp {
+            aux,
+            buf,
+            len,
+            offset,
+            read,
+        } = op;
+        let outcome = if read {
+            q.read(self.desc, buf, len, offset, token)
+        } else {
+            q.write(self.desc, buf, len, offset, token)
+        };
+        match outcome {
+            Ok(()) => {
+                self.aux.insert(token, (aux, len));
+                None
+            }
+            Err(buf) => Some(AuxOp {
+                aux,
+                buf,
+                len,
+                offset,
+                read,
+            }),
+        }
+    }
+
+    /// Encodes `header` into a pool buffer and queues it as `aux`.
+    fn write_header(&mut self, q: &mut dyn IoQueue, header: &SegmentHeader, aux: Aux) -> Result<()> {
+        let mut buf = q.pool().alloc(SEGMENT_HEADER_LEN as usize).ok_or(Error::Busy)?;
+        header.encode(&mut buf[..SEGMENT_HEADER_LEN as usize]);
+        let offset = self.shared.geometry.segment_offset(header.seg_no);
+        self.enqueue_aux(
+            q,
+            AuxOp {
+                aux,
+                buf,
+                len: SEGMENT_HEADER_LEN as usize,
+                offset,
+                read: false,
+            },
+        );
         Ok(())
     }
 
-    /// Waits for the auxiliary operation `token`.
-    fn wait_aux(&mut self, token: u64) -> Result<IoCompletion> {
-        loop {
-            if let Some(done) = self.aux_done.remove(&token) {
-                return Ok(done);
+    fn finish_aux(&mut self, aux: Aux, len: usize, mut done: IoCompletion) {
+        if let Ok(n) = done.result
+            && n != len
+        {
+            done.result = Err(io::Error::other(format!("short I/O: {n} of {len} bytes")));
+        }
+        let failure = match &done.result {
+            Ok(_) => None,
+            Err(e) => Some(e.to_string()),
+        };
+        match aux {
+            Aux::OpenHeader { seg_no } => {
+                if let Some(seg) = self.segment_mut(seg_no) {
+                    seg.opened = true;
+                    // A segment whose header may not be on disk is not
+                    // recoverable: abandon it; its batches fail at push time.
+                    if failure.is_some() {
+                        seg.broken = true;
+                    }
+                }
             }
-            self.poll_io(true)?;
-        }
-    }
-
-    /// Reads `len` bytes at `offset` within `seg_no` through the queue,
-    /// applying write completions while waiting.
-    fn read_blocking(&mut self, seg_no: u32, offset: u64, len: usize) -> Result<PooledBuf> {
-        let buf = self.alloc(len)?;
-        let token = self.next_aux_token();
-        while self.queue.in_flight() >= self.queue.depth() {
-            self.poll_io(true)?;
-        }
-        self.queue
-            .read(buf, len, self.shared.geometry.segment_offset(seg_no) + offset, token)?;
-        let done = self.wait_aux(token)?;
-        match done.result {
-            Ok(n) if n == len => Ok(done.buf.expect("read returns its buffer")),
-            Ok(n) => Err(Error::Io(io::Error::other(format!("short read: {n} of {len} bytes")))),
-            Err(e) => Err(Error::Io(e)),
+            Aux::Footer { seg_no } => {
+                if let Some(s) = self.sealing.iter_mut().find(|s| s.seg.seg_no == seg_no)
+                    && let SealStage::Footer { outstanding, .. } = &mut s.stage
+                {
+                    *outstanding -= 1;
+                }
+                // A failed footer piece is not fatal: recovery falls back to a
+                // scan when the footer does not validate.
+            }
+            Aux::SealHeader { seg_no } => {
+                if let Some(pos) = self.sealing.iter().position(|s| s.seg.seg_no == seg_no) {
+                    let sealing = self.sealing.swap_remove(pos);
+                    // Even if the header write failed the data is intact; the
+                    // in-memory state moves on and recovery scans the segment.
+                    self.shared.segments.set_sealed(seg_no, sealing.seg.tail);
+                }
+            }
+            Aux::Fsync { ticket } => {
+                if let Some(b) = self.barriers.iter_mut().find(|b| b.ticket == ticket) {
+                    b.fsync = Fsync::Done;
+                    if let Some(e) = failure {
+                        b.error.get_or_insert(e);
+                    }
+                }
+            }
+            Aux::ReclaimRead => {
+                let Some(job) = &mut self.reclaim else {
+                    return;
+                };
+                match (done.result, done.buf) {
+                    (Ok(n), Some(buf)) => {
+                        job.stage = ReclaimStage::Process {
+                            buf,
+                            len: n,
+                            rel: 0,
+                            rec: 0,
+                        };
+                    }
+                    (Err(e), _) => {
+                        let ticket = job.ticket;
+                        self.reclaim = None;
+                        self.complete(ticket, Err(Error::Io(e)));
+                    }
+                    (Ok(_), None) => unreachable!("reads return their buffer"),
+                }
+            }
+            Aux::FreeHeader { seg_no } => {
+                let Some(job) = self.reclaim.take() else {
+                    return;
+                };
+                debug_assert_eq!(job.seg_no, seg_no);
+                match failure {
+                    None => {
+                        let segments = &self.shared.segments;
+                        segments.set(seg_no, SegmentState::Free, job.kind, job.seq);
+                        segments.reset_live(seg_no);
+                        self.free.push_back(seg_no);
+                        self.complete(job.ticket, Ok(Outcome::Reclaim(job.report)));
+                    }
+                    Some(e) => self.complete(job.ticket, Err(io_error(e))),
+                }
+            }
         }
     }
 
     // -- segment lifecycle ---------------------------------------------------
 
-    /// Returns the active segment of `kind` with room for a batch of
-    /// `batch_len` bytes and `new_records` footer entries, sealing and
-    /// allocating as needed.
-    fn ensure_room(&mut self, kind: SegmentKind, batch_len: u64, new_records: usize) -> Result<&mut Active> {
+    /// Makes sure the active segment of `kind` has room for a batch of
+    /// `batch_len` bytes and `new_records` footer entries, parking the current
+    /// one for sealing and allocating a fresh one as needed.
+    fn ensure_room(
+        &mut self,
+        q: &mut dyn IoQueue,
+        kind: SegmentKind,
+        batch_len: u64,
+        new_records: usize,
+    ) -> Result<()> {
         let k = slot(kind);
         let segment_size = self.shared.superblock.segment_size;
         let fits = self.active[k]
             .as_ref()
             .is_some_and(|a| a.fits(batch_len, new_records, segment_size));
-        if !fits {
-            if self.active[k].is_some() {
-                // The footer must describe every record of the segment, so all
-                // of its batches have to be applied first.
-                self.wait_inflight()?;
-                let active = self.active[k].take().expect("checked");
-                self.seal(active)?;
-            }
-            let active = self.allocate(kind)?;
-            if !active.fits(batch_len, new_records, segment_size) {
-                // Only reachable if format validation was bypassed.
-                return Err(Error::ValueTooLarge {
-                    len: batch_len,
-                    max: segment_size,
-                });
-            }
-            self.active[k] = Some(active);
+        if fits {
+            return Ok(());
         }
-        Ok(self.active[k].as_mut().expect("just ensured"))
+        // Allocate first so a failure leaves the current segment in place.
+        let fresh = self.allocate(q, kind)?;
+        if !fresh.fits(batch_len, new_records, segment_size) {
+            // Only reachable if format validation was bypassed; the header
+            // write is already queued, so the segment is parked, not reused.
+            self.park(fresh);
+            return Err(Error::ValueTooLarge {
+                len: batch_len,
+                max: segment_size,
+            });
+        }
+        if let Some(old) = self.active[k].replace(fresh) {
+            self.park(old);
+        }
+        Ok(())
     }
 
-    fn allocate(&mut self, kind: SegmentKind) -> Result<Active> {
+    /// Takes a free segment, queues its header write and returns it as
+    /// active (batches wait until the header has landed).
+    fn allocate(&mut self, q: &mut dyn IoQueue, kind: SegmentKind) -> Result<Active> {
         let seg_no = self.free.pop_front().ok_or(Error::NoSpace)?;
         let seq = self.next_seq;
+        let header = self.shared.segment_header(seg_no, SegmentState::Active, kind, seq);
+        if let Err(e) = self.write_header(q, &header, Aux::OpenHeader { seg_no }) {
+            self.free.push_front(seg_no);
+            return Err(e);
+        }
         self.next_seq += 1;
-        self.shared.write_segment_header(&SegmentHeader {
-            disk_uuid: self.shared.superblock.disk_uuid,
-            seg_no,
-            state: SegmentState::Active,
-            kind,
-            seq,
-            footer_offset: 0,
-            footer_len: 0,
-            record_count: 0,
-        })?;
         self.shared.segments.set(seg_no, SegmentState::Active, kind, seq);
         Ok(Active {
             seg_no,
@@ -1110,18 +1716,162 @@ impl Writer {
             tail: self.shared.geometry.data_start(),
             footer: Vec::new(),
             broken: false,
+            opened: false,
+            unapplied: 0,
+            unapplied_records: 0,
         })
     }
 
-    fn seal(&self, active: Active) -> Result<()> {
-        seal_segment(
-            &self.shared,
-            active.seg_no,
-            active.seq,
-            active.kind,
-            active.tail,
-            &active.footer,
-        )
+    /// Hands a segment that is no longer written to the sealing state
+    /// machine.
+    fn park(&mut self, seg: Active) {
+        self.sealing.push(Sealing {
+            seg,
+            stage: SealStage::Draining,
+        });
+    }
+
+    fn advance_sealing(&mut self, q: &mut dyn IoQueue) {
+        for i in 0..self.sealing.len() {
+            self.advance_one_sealing(q, i);
+        }
+    }
+
+    fn advance_one_sealing(&mut self, q: &mut dyn IoQueue, i: usize) {
+        // The stage is taken out while it is worked on so the queue and the
+        // pool can be used without holding a borrow into `sealing`.
+        loop {
+            let stage = std::mem::replace(&mut self.sealing[i].stage, SealStage::Header);
+            match stage {
+                SealStage::Draining => {
+                    let seg = &self.sealing[i].seg;
+                    if seg.unapplied > 0 {
+                        self.sealing[i].stage = SealStage::Draining;
+                        return;
+                    }
+                    let len = footer_len(seg.footer.len()) as usize;
+                    let mut encoded = AlignedBuf::zeroed(len);
+                    encode_footer(seg.seq, &seg.footer, &mut encoded);
+                    self.sealing[i].stage = SealStage::Footer {
+                        encoded,
+                        written: 0,
+                        outstanding: 0,
+                    };
+                }
+                SealStage::Footer {
+                    encoded,
+                    mut written,
+                    mut outstanding,
+                } => {
+                    let seg = &self.sealing[i].seg;
+                    let (seg_no, tail, kind, seq, count) = (seg.seg_no, seg.tail, seg.kind, seg.seq, seg.footer.len());
+                    let base = self.shared.geometry.segment_offset(seg_no);
+                    let max = q.pool().max_class();
+                    while written < encoded.len() {
+                        let piece = (encoded.len() - written).min(max);
+                        let Some(mut buf) = q.pool().alloc(piece) else {
+                            self.sealing[i].stage = SealStage::Footer {
+                                encoded,
+                                written,
+                                outstanding,
+                            };
+                            return;
+                        };
+                        buf[..piece].copy_from_slice(&encoded[written..written + piece]);
+                        let op = AuxOp {
+                            aux: Aux::Footer { seg_no },
+                            buf,
+                            len: piece,
+                            offset: base + tail + written as u64,
+                            read: false,
+                        };
+                        written += piece;
+                        // A deferred piece is still outstanding.
+                        outstanding += 1;
+                        self.enqueue_aux(q, op);
+                    }
+                    if outstanding > 0 {
+                        self.sealing[i].stage = SealStage::Footer {
+                            encoded,
+                            written,
+                            outstanding,
+                        };
+                        return;
+                    }
+                    let header = SegmentHeader {
+                        footer_offset: tail,
+                        footer_len: encoded.len() as u64,
+                        record_count: count as u64,
+                        ..self.shared.segment_header(seg_no, SegmentState::Sealed, kind, seq)
+                    };
+                    match self.write_header(q, &header, Aux::SealHeader { seg_no }) {
+                        Ok(()) => {
+                            self.sealing[i].stage = SealStage::Header;
+                        }
+                        Err(_) => {
+                            self.sealing[i].stage = SealStage::Footer {
+                                encoded,
+                                written,
+                                outstanding,
+                            };
+                        }
+                    }
+                    return;
+                }
+                SealStage::Header => {
+                    self.sealing[i].stage = SealStage::Header;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn advance_barriers(&mut self, q: &mut dyn IoQueue) {
+        let oldest = self.oldest_unapplied();
+        let mut i = 0;
+        while i < self.barriers.len() {
+            let ticket = self.barriers[i].ticket;
+            let until = self.barriers[i].until;
+            let applied = oldest.is_none_or(|o| o >= until);
+            if !applied {
+                i += 1;
+                continue;
+            }
+            if matches!(self.barriers[i].fsync, Fsync::Pending) {
+                let token = self.next_aux_token();
+                match q.fsync(self.desc, token) {
+                    Ok(()) => {
+                        self.aux.insert(token, (Aux::Fsync { ticket }, 0));
+                        self.barriers[i].fsync = Fsync::Issued;
+                    }
+                    Err(_) => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            if matches!(self.barriers[i].fsync, Fsync::Issued) {
+                i += 1;
+                continue;
+            }
+            if let Some(segs) = &self.barriers[i].seal
+                && segs.iter().any(|s| self.sealing.iter().any(|x| x.seg.seg_no == *s))
+            {
+                i += 1;
+                continue;
+            }
+            let b = self.barriers.remove(i).expect("index in range");
+            let outcome = if b.seal.is_some() {
+                Outcome::Seal
+            } else {
+                Outcome::Flush
+            };
+            let result = match b.error {
+                Some(e) => Err(io_error(e)),
+                None => Ok(outcome),
+            };
+            self.complete(b.ticket, result);
+        }
     }
 
     // -- reclaim -------------------------------------------------------------
@@ -1135,167 +1885,276 @@ impl Writer {
             .min()
     }
 
-    fn reclaim_segment(&mut self, seg_no: u32, policy: ReclaimPolicy) -> Result<ReclaimReport> {
-        // Liveness is judged against the index, which must reflect every
-        // accepted foreground write.
-        self.flush_pending(SegmentKind::Hot)?;
-        self.wait_inflight()?;
-
-        let shared = self.shared.clone();
-        let seg_header = shared.read_segment_header(seg_no)?;
-        if seg_header.state != SegmentState::Sealed {
-            return Err(Error::InvalidOption(format!("segment {seg_no} is not sealed")));
+    fn set_reclaim_stage(&mut self, stage: ReclaimStage) {
+        if let Some(job) = &mut self.reclaim {
+            job.stage = stage;
         }
-        let is_oldest = self.oldest_live_seq() == Some(seg_header.seq);
-        let failures_before = self.relocation_failures;
-        let mut report = ReclaimReport {
-            seg_no,
-            ..Default::default()
-        };
+    }
 
-        let window = align_up(shared.options.scan_window as u64, PAGE_SIZE).max(self.max_batch) as usize;
-        let end = seg_header.footer_offset;
-        let mut cursor = shared.geometry.data_start();
-        'scan: while cursor < end {
-            let len = (end - cursor).min(window as u64) as usize;
-            let buf = self.read_blocking(seg_no, cursor, len)?;
-            let mut rel = 0usize;
-            loop {
-                match next_batch(
-                    &buf[..len],
-                    rel,
-                    seg_header.seq,
-                    self.max_batch,
-                    end - cursor - rel as u64,
-                ) {
-                    BatchStep::Batch(batch, batch_len) => {
-                        let batch_off = cursor + rel as u64;
-                        // A corrupt batch aborts the pass without freeing
-                        // anything: live records behind it could be lost.
-                        for rec in parse_batch(&buf[rel..rel + batch_len], &batch, true)? {
-                            let loc = Location {
-                                seg_no,
-                                offset: (batch_off + rec.offset_in_batch as u64) as u32,
-                            };
-                            report.records += 1;
-                            // Reclaim is off the hot path; copying the checksum
-                            // array out keeps the re-encoding API simple.
-                            let checksums = rec.checksums.to_vec();
-                            self.reclaim_record(
-                                &rec.header,
-                                &checksums,
-                                rec.value,
-                                loc,
-                                policy,
-                                is_oldest,
-                                &mut report,
-                            )?;
+    fn finish_reclaim(&mut self, result: Result<Outcome>) {
+        if let Some(job) = self.reclaim.take() {
+            self.complete(job.ticket, result);
+        }
+    }
+
+    fn advance_reclaim(&mut self, q: &mut dyn IoQueue) {
+        loop {
+            // The stage is taken out while it is worked on; every arm puts a
+            // stage back before returning or looping.
+            let Some(stage) = self
+                .reclaim
+                .as_mut()
+                .map(|j| std::mem::replace(&mut j.stage, ReclaimStage::Reading))
+            else {
+                return;
+            };
+            match stage {
+                ReclaimStage::Read => {
+                    let (seg_no, cursor, end, window) = {
+                        let j = self.reclaim.as_ref().expect("job exists");
+                        (j.seg_no, j.cursor, j.end, j.window)
+                    };
+                    if cursor >= end {
+                        // Every record is processed. The batches carrying the
+                        // relocations, and the foreground writes whose
+                        // existence justified dropping records (a pending
+                        // tombstone, a newer version), must be durable before
+                        // the victim disappears.
+                        if let Err(e) = self.close_all_pending(q) {
+                            match e {
+                                Error::Busy => {
+                                    self.set_reclaim_stage(ReclaimStage::Read);
+                                    return;
+                                }
+                                e => {
+                                    self.finish_reclaim(Err(e));
+                                    return;
+                                }
+                            }
                         }
-                        rel += batch_len;
+                        let until = self.next_batch_id;
+                        let job = self.reclaim.as_mut().expect("job exists");
+                        job.drain_until = until;
+                        job.stage = ReclaimStage::Drain;
+                        continue;
                     }
-                    BatchStep::NeedMore => break,
-                    BatchStep::End => break 'scan,
+                    let len = (end - cursor).min(window as u64) as usize;
+                    let Some(buf) = q.pool().alloc(len) else {
+                        self.set_reclaim_stage(ReclaimStage::Read);
+                        return;
+                    };
+                    let offset = self.shared.geometry.segment_offset(seg_no) + cursor;
+                    self.set_reclaim_stage(ReclaimStage::Reading);
+                    self.enqueue_aux(
+                        q,
+                        AuxOp {
+                            aux: Aux::ReclaimRead,
+                            buf,
+                            len,
+                            offset,
+                            read: true,
+                        },
+                    );
+                    return;
+                }
+                ReclaimStage::Reading => {
+                    self.set_reclaim_stage(ReclaimStage::Reading);
+                    return;
+                }
+                ReclaimStage::Process { buf, len, rel, rec } => match self.process_window(q, buf, len, rel, rec) {
+                    Ok(None) => self.set_reclaim_stage(ReclaimStage::Read),
+                    Ok(Some(stage)) => {
+                        self.set_reclaim_stage(stage);
+                        return;
+                    }
+                    Err(e) => {
+                        self.finish_reclaim(Err(e));
+                        return;
+                    }
+                },
+                ReclaimStage::Drain => {
+                    let (until, failed, seg_no) = {
+                        let j = self.reclaim.as_ref().expect("job exists");
+                        (j.drain_until, j.failed, j.seg_no)
+                    };
+                    if !self.oldest_unapplied().is_none_or(|o| o >= until) {
+                        self.set_reclaim_stage(ReclaimStage::Drain);
+                        return;
+                    }
+                    if failed {
+                        self.finish_reclaim(Err(io_error(format!(
+                            "segment {seg_no}: relocation writes failed; segment kept"
+                        ))));
+                        return;
+                    }
+                    self.set_reclaim_stage(ReclaimStage::Pins);
+                }
+                ReclaimStage::Pins => {
+                    // Readers that looked the victim up before its entries
+                    // were removed hold a pin; the removals are ordered before
+                    // this check.
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    let (seg_no, kind, seq) = {
+                        let j = self.reclaim.as_ref().expect("job exists");
+                        (j.seg_no, j.kind, j.seq)
+                    };
+                    if self.shared.segments.pins(seg_no) > 0 {
+                        self.set_reclaim_stage(ReclaimStage::Pins);
+                        return;
+                    }
+                    let header = self.shared.segment_header(seg_no, SegmentState::Free, kind, seq);
+                    match self.write_header(q, &header, Aux::FreeHeader { seg_no }) {
+                        Ok(()) => self.set_reclaim_stage(ReclaimStage::Freeing),
+                        Err(_) => self.set_reclaim_stage(ReclaimStage::Pins),
+                    }
+                    return;
+                }
+                ReclaimStage::Freeing => {
+                    self.set_reclaim_stage(ReclaimStage::Freeing);
+                    return;
                 }
             }
-            if rel == 0 {
-                return Err(Error::corrupt(format!(
-                    "segment {seg_no}: batch at {cursor} larger than the scan window"
-                )));
+        }
+    }
+
+    /// Processes the window `buf[..len]` from batch offset `rel`, record
+    /// `rec`. Returns the stage to park in when the pool runs dry mid-window,
+    /// or `None` when the window is consumed and the cursor advanced.
+    fn process_window(
+        &mut self,
+        q: &mut dyn IoQueue,
+        buf: PooledBuf,
+        len: usize,
+        mut rel: usize,
+        mut rec: usize,
+    ) -> Result<Option<ReclaimStage>> {
+        let (seg_no, seq, cursor, end, policy, is_oldest) = {
+            let job = self.reclaim.as_ref().expect("job exists");
+            (job.seg_no, job.seq, job.cursor, job.end, job.policy, job.is_oldest)
+        };
+        loop {
+            match next_batch(&buf[..len], rel, seq, self.max_batch, end - cursor - rel as u64) {
+                BatchStep::Batch(batch, batch_len) => {
+                    let batch_off = cursor + rel as u64;
+                    // A structurally corrupt batch aborts the pass without
+                    // freeing anything: live records behind it could be lost.
+                    // Value checksums are checked per record below, so one
+                    // rotten value only drops that record.
+                    let records = parse_batch(&buf[rel..rel + batch_len], &batch, false)?;
+                    for (i, r) in records.iter().enumerate().skip(rec) {
+                        let loc = Location {
+                            seg_no,
+                            offset: (batch_off + r.offset_in_batch as u64) as u32,
+                        };
+                        // Reclaim is off the hot path; copying the checksum
+                        // array out keeps the re-encoding API simple.
+                        let checksums = r.checksums.to_vec();
+                        match self.reclaim_record(q, &r.header, &checksums, r.value, loc, policy, is_oldest) {
+                            Ok(()) => self.reclaim.as_mut().expect("job exists").report.records += 1,
+                            Err(Error::Busy) => {
+                                return Ok(Some(ReclaimStage::Process { buf, len, rel, rec: i }));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    rel += batch_len;
+                    rec = 0;
+                }
+                BatchStep::NeedMore => break,
+                BatchStep::End => {
+                    let job = self.reclaim.as_mut().expect("job exists");
+                    job.cursor = job.end;
+                    return Ok(None);
+                }
             }
-            cursor += rel as u64;
         }
-
-        // Relocated records must be applied to the index before the victim
-        // disappears from it, and every relocation must have succeeded.
-        self.flush_pending(SegmentKind::Cold)?;
-        self.wait_inflight()?;
-        if self.relocation_failures != failures_before {
-            return Err(Error::Io(io::Error::other(format!(
-                "segment {seg_no}: relocation writes failed; segment kept"
-            ))));
+        if rel == 0 {
+            return Err(Error::corrupt(format!(
+                "segment {seg_no}: batch at {cursor} larger than the scan window"
+            )));
         }
-
-        // Readers that looked the victim up before its entries were removed
-        // hold a pin; wait for them to finish.
-        while shared.segments.pins(seg_no) > 0 {
-            thread::yield_now();
-        }
-        shared.write_segment_header(&SegmentHeader {
-            disk_uuid: shared.superblock.disk_uuid,
-            seg_no,
-            state: SegmentState::Free,
-            kind: seg_header.kind,
-            seq: seg_header.seq,
-            footer_offset: 0,
-            footer_len: 0,
-            record_count: 0,
-        })?;
-        shared
-            .segments
-            .set(seg_no, SegmentState::Free, seg_header.kind, seg_header.seq);
-        shared.segments.reset_live(seg_no);
-        self.free.push_back(seg_no);
-        Ok(report)
+        let job = self.reclaim.as_mut().expect("job exists");
+        job.cursor += rel as u64;
+        Ok(None)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn reclaim_record(
         &mut self,
+        q: &mut dyn IoQueue,
         hdr: &RecordHeader,
         checksums: &[u32],
         value: &[u8],
         loc: Location,
         policy: ReclaimPolicy,
         is_oldest: bool,
-        report: &mut ReclaimReport,
     ) -> Result<()> {
-        let shared = self.shared.clone();
         match hdr.kind {
             RecordKind::Data => {
-                let Some(current) = shared.index.get(&hdr.key).filter(|v| v.loc == loc) else {
-                    report.dropped += 1;
+                let Some(current) = self.index.get(&hdr.key).filter(|v| v.loc == loc) else {
+                    self.reclaim.as_mut().expect("job exists").report.dropped += 1;
                     return Ok(());
                 };
-                let keep = !shared.is_expired(hdr.expire_at)
+                // A value that fails its checksums can never be read again;
+                // it is dropped rather than copied forward.
+                let intact = verify_blocks_with(value, 0, |b| checksums.get(b as usize).copied()).is_ok();
+                let keep = intact
+                    && !self.shared.is_expired(hdr.expire_at)
                     && match policy {
                         ReclaimPolicy::Storage => true,
                         ReclaimPolicy::Cache { reinsert_accessed } => reinsert_accessed && current.is_accessed(),
                     };
                 if !keep {
-                    shared.index.remove_if_at(&hdr.key, loc);
+                    // Decided before any I/O, so a `Busy` retry cannot repeat it.
+                    self.index.remove_if_at(&hdr.key, loc);
+                    let report = &mut self.reclaim.as_mut().expect("job exists").report;
                     report.dropped += 1;
+                    if !intact {
+                        report.corrupt += 1;
+                    }
                     return Ok(());
                 }
+                // Relocated records keep their LSN (see the module docs).
                 let apply = Apply::Relocate(loc);
                 if hdr.is_large() {
-                    let mut large = self.prepare_large(hdr.value_len)?;
+                    let mut large = self.prepare_large(q, hdr.value_len)?;
+                    self.ensure_room(q, SegmentKind::Cold, large_batch_len(hdr.value_len), 1)?;
                     large.value_mut().copy_from_slice(value);
-                    let lsn = self.take_lsn();
                     let flags = record_flags(BatchKind::Large, hdr.expire_at);
-                    let new = header(RecordKind::Data, flags, hdr.value_len, lsn, hdr.key, hdr.expire_at);
-                    self.write_large(SegmentKind::Cold, &new, checksums, large.buf, apply, None)?;
+                    let new = header(RecordKind::Data, flags, hdr.value_len, hdr.lsn, hdr.key, hdr.expire_at);
+                    self.write_large(q, SegmentKind::Cold, &new, checksums, large.buf, apply, None);
                 } else {
                     let batch = small_batch_kind(hdr.value_len, hdr.expire_at);
-                    self.reserve_small(SegmentKind::Cold, batch, value.len())?;
-                    let lsn = self.take_lsn();
+                    self.reserve_small(q, SegmentKind::Cold, batch, value.len())?;
                     let flags = record_flags(batch, hdr.expire_at);
-                    let new = header(RecordKind::Data, flags, hdr.value_len, lsn, hdr.key, hdr.expire_at);
-                    self.append_small(SegmentKind::Cold, batch, &new, checksums, value, apply, None)?;
+                    let new = header(RecordKind::Data, flags, hdr.value_len, hdr.lsn, hdr.key, hdr.expire_at);
+                    self.append_small(q, SegmentKind::Cold, batch, &new, checksums, value, apply, None);
                 }
+                let report = &mut self.reclaim.as_mut().expect("job exists").report;
                 report.relocated += 1;
                 report.bytes_relocated += value.len() as u64;
             }
             RecordKind::Tombstone => {
                 // A live newer version supersedes the tombstone; and if this is
-                // the oldest segment, no older data can exist.
-                if shared.index.get(&hdr.key).is_some() || is_oldest {
-                    report.tombstones_dropped += 1;
+                // the oldest segment, no older data can exist. Otherwise it is
+                // carried forward with its LSN, so a put of the key that is
+                // still pending keeps outranking it.
+                if self.index.get(&hdr.key).is_some() || is_oldest {
+                    self.reclaim.as_mut().expect("job exists").report.tombstones_dropped += 1;
                 } else {
-                    self.reserve_small(SegmentKind::Cold, BatchKind::Inline, 0)?;
-                    let lsn = self.take_lsn();
-                    let new = header(RecordKind::Tombstone, 0, 0, lsn, hdr.key, 0);
-                    self.append_small(SegmentKind::Cold, BatchKind::Inline, &new, &[], &[], Apply::None, None)?;
-                    report.tombstones_relocated += 1;
+                    self.reserve_small(q, SegmentKind::Cold, BatchKind::Inline, 0)?;
+                    let new = header(RecordKind::Tombstone, 0, 0, hdr.lsn, hdr.key, 0);
+                    self.append_small(
+                        q,
+                        SegmentKind::Cold,
+                        BatchKind::Inline,
+                        &new,
+                        &[],
+                        &[],
+                        Apply::Tombstone,
+                        None,
+                    );
+                    self.reclaim.as_mut().expect("job exists").report.tombstones_relocated += 1;
                 }
             }
         }
@@ -1303,74 +2162,12 @@ impl Writer {
     }
 }
 
-/// Updates the index and live-byte accounting for a record now on disk.
-/// Returns whether the index now points at it.
-fn apply_record(shared: &Shared, seg_no: u32, entry: &FooterEntry, apply: Apply) -> bool {
-    let footprint = RecordGeometry::footprint(entry.value_len, entry.flags);
-    let value = IndexValue {
-        loc: Location {
-            seg_no,
-            offset: entry.offset,
-        },
-        value_off: entry.value_off,
-        value_len: entry.value_len,
-        flags: flags_from_record(entry.flags),
-        crc: entry.crc,
-        lsn: entry.lsn,
-    };
-    let segments = &shared.segments;
-    match apply {
-        Apply::Insert => match shared.index.insert_if_newer(entry.key, value) {
-            InsertOutcome::Inserted => {
-                segments.add_live(seg_no, footprint);
-                true
-            }
-            InsertOutcome::Replaced(old) => {
-                segments.sub_live(
-                    old.loc.seg_no,
-                    RecordGeometry::footprint(old.value_len, old.record_flags()),
-                );
-                segments.add_live(seg_no, footprint);
-                true
-            }
-            InsertOutcome::Rejected => false,
-        },
-        Apply::Relocate(from) => {
-            let moved = shared.index.replace_if_at(&entry.key, from, value);
-            if moved {
-                segments.add_live(seg_no, footprint);
-            }
-            moved
-        }
-        Apply::None => false,
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.shared.next_lsn.store(self.next_lsn, Ordering::Release);
+        self.shared.next_seq.store(self.next_seq, Ordering::Release);
+        self.shared.writer_taken.store(false, Ordering::Release);
     }
-}
-
-/// Writes a footer at `tail` and marks the segment sealed.
-pub(crate) fn seal_segment(
-    shared: &Shared,
-    seg_no: u32,
-    seq: u64,
-    kind: SegmentKind,
-    tail: u64,
-    footer: &[FooterEntry],
-) -> Result<()> {
-    let len = footer_len(footer.len());
-    let mut buf = moat_common::AlignedBuf::zeroed(len as usize);
-    encode_footer(seq, footer, &mut buf);
-    shared.write_segment_bytes(seg_no, tail, &buf)?;
-    shared.write_segment_header(&SegmentHeader {
-        disk_uuid: shared.superblock.disk_uuid,
-        seg_no,
-        state: SegmentState::Sealed,
-        kind,
-        seq,
-        footer_offset: tail,
-        footer_len: len,
-        record_count: footer.len() as u64,
-    })?;
-    shared.segments.set_state(seg_no, SegmentState::Sealed);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1379,53 +2176,79 @@ mod tests {
     use crate::layout::prefer_framed;
 
     #[test]
+    fn short_auxiliary_io_fails_without_reclaiming_live_data() {
+        use crate::{
+            FormatOptions, MemDevice, Options, QueueOptions, blocking,
+            io::{CompletionOrder, SyncQueue},
+        };
+        use moat_common::{HugePages, PoolOptions};
+
+        for reclaim in [false, true] {
+            let device = Arc::new(MemDevice::new(5 << 20));
+            crate::format(
+                &*device,
+                &FormatOptions {
+                    segment_size: 1 << 20,
+                    chunk_max: 64 << 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let (engine, _) = crate::open(
+                device,
+                Options {
+                    index_capacity: 64,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut queue = SyncQueue::new(
+                &QueueOptions {
+                    pool: PoolOptions {
+                        bytes: 2 << 20,
+                        max_class: 1 << 20,
+                        huge_pages: HugePages::Disabled,
+                    },
+                    ..Default::default()
+                },
+                CompletionOrder::Fifo,
+            )
+            .unwrap();
+            let mut writer = engine.writer(&mut queue).unwrap();
+            let key = ChunkId::from_u128(1);
+            writer.put(&mut queue, key, b"value", PutOptions::default()).unwrap();
+            let ticket = if reclaim {
+                blocking::seal(&mut queue, &mut writer).unwrap();
+                writer.reclaim(&mut queue, ReclaimPolicy::Storage).unwrap().unwrap()
+            } else {
+                writer.flush(&mut queue).unwrap()
+            };
+            queue.poll(false).unwrap();
+            let mut done = Vec::new();
+            assert_eq!(queue.take(writer.desc, &mut done), 1);
+            let mut completion = done.pop().unwrap();
+            completion.result = Ok(0);
+            let (aux, len) = writer.aux.remove(&completion.token).unwrap();
+            writer.finish_aux(aux, len, completion);
+            assert!(blocking::wait(&mut queue, &mut writer, ticket).is_err());
+            if reclaim {
+                assert_eq!(engine.usage().sealed_segments, 1);
+                let mut reader = engine.reader(&mut queue).unwrap();
+                assert_eq!(
+                    &*blocking::get(&mut queue, &mut reader, &key, None).unwrap().unwrap(),
+                    b"value"
+                );
+            } else {
+                assert!(!engine.contains(&key));
+            }
+        }
+    }
+
+    #[test]
     fn framing_decision_for_near_page_multiples() {
         assert!(prefer_framed(40942));
         assert_eq!(small_batch_kind(40942, 0), BatchKind::Framed);
         assert_eq!(small_batch_kind(40942, 5), BatchKind::Inline);
         assert_eq!(small_batch_kind(5000, 0), BatchKind::Inline);
-    }
-}
-
-#[cfg(test)]
-mod framed_tests {
-    use std::sync::Arc;
-
-    use moat_common::{HugePages, PoolOptions};
-
-    use crate::{FormatOptions, MemDevice, Options, PutOptions, QueueOptions, format, open};
-
-    #[test]
-    fn near_page_multiple_value_is_framed_and_page_aligned() {
-        let device = Arc::new(MemDevice::new(8 << 20));
-        format(
-            &*device,
-            &FormatOptions {
-                segment_size: 1 << 20,
-                chunk_max: 128 << 10,
-                disk_uuid: [1; 16],
-            },
-        )
-        .unwrap();
-        let opts = Options {
-            queue: QueueOptions {
-                depth: 8,
-                pool: PoolOptions {
-                    bytes: 8 << 20,
-                    max_class: 1 << 20,
-                    huge_pages: HugePages::Disabled,
-                },
-                force_sync: true,
-            },
-            ..Default::default()
-        };
-        let opened = open(device, opts).unwrap();
-        let mut writer = opened.writer;
-        let id = moat_common::ChunkId::from_u128(7);
-        writer.put(id, &vec![0xabu8; 40942], PutOptions::default()).unwrap();
-        writer.flush().unwrap();
-        let v = writer.shared.index.get(&id).unwrap();
-        assert!(v.is_framed(), "flags {:#x}", v.flags);
-        assert_eq!(v.value_off % 4096, 0, "value offset {}", v.value_off);
     }
 }

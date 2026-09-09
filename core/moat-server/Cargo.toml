@@ -13,8 +13,8 @@
 # limitations under the License.
 
 [package]
-name = "moat-common"
-description = "Common types shared by all moat components: chunk identifiers, checksums, alignment helpers."
+name = "moat-server"
+description = "The chunkserver node: disk discovery, placement, worker threads that drive every disk's engine through one I/O queue."
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -25,17 +25,21 @@ license.workspace = true
 readme.workspace = true
 rust-version.workspace = true
 
-[features]
-# `From` conversions between `ChunkId` and `uuid::Uuid`.
-uuid = ["dep:uuid"]
-
 [dependencies]
-crc-fast = { workspace = true }
 libc = { workspace = true }
-uuid = { workspace = true, optional = true }
+moat-common = { workspace = true }
+moat-engine = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [[bench]]
-name = "checksum"
+name = "node"
+harness = false
+
+[[bench]]
+name = "queue"
 harness = false
 
 [lints]

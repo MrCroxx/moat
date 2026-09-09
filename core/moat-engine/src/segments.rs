@@ -59,6 +59,8 @@ struct SegmentMeta {
     seq: AtomicU64,
     live_bytes: AtomicU64,
     pins: AtomicU32,
+    /// Sealed segments: offset where record data ends (and the footer starts).
+    data_end: AtomicU64,
 }
 
 /// Per-segment state visible to all threads.
@@ -79,6 +81,7 @@ impl SegmentTable {
                 seq: AtomicU64::new(0),
                 live_bytes: AtomicU64::new(0),
                 pins: AtomicU32::new(0),
+                data_end: AtomicU64::new(0),
             })
             .collect();
         Self { metas }
@@ -106,6 +109,19 @@ impl SegmentTable {
     /// Sequence number of the segment's current incarnation.
     pub fn seq(&self, seg_no: u32) -> u64 {
         self.meta(seg_no).seq.load(Ordering::Acquire)
+    }
+
+    /// Usage kind of the segment's current incarnation.
+    pub fn kind(&self, seg_no: u32) -> SegmentKind {
+        match self.meta(seg_no).kind.load(Ordering::Relaxed) {
+            1 => SegmentKind::Cold,
+            _ => SegmentKind::Hot,
+        }
+    }
+
+    /// Offset within a sealed segment where its record data ends.
+    pub fn data_end(&self, seg_no: u32) -> u64 {
+        self.meta(seg_no).data_end.load(Ordering::Acquire)
     }
 
     /// Bytes of records in the segment that the index still points at.
@@ -136,8 +152,11 @@ impl SegmentTable {
         m.state.store(state as u8, Ordering::Release);
     }
 
-    pub(crate) fn set_state(&self, seg_no: u32, state: SegmentState) {
-        self.meta(seg_no).state.store(state as u8, Ordering::Release);
+    /// Marks the segment sealed with its data ending at `data_end`.
+    pub(crate) fn set_sealed(&self, seg_no: u32, data_end: u64) {
+        let m = self.meta(seg_no);
+        m.data_end.store(data_end, Ordering::Release);
+        m.state.store(SegmentState::Sealed as u8, Ordering::Release);
     }
 
     pub(crate) fn add_live(&self, seg_no: u32, bytes: u64) {

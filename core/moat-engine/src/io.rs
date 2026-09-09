@@ -12,24 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Asynchronous, batched I/O queues.
+//! Asynchronous, batched I/O queues shared by every engine on a thread.
 //!
-//! The data path never blocks on a single I/O. A thread owns an [`IoQueue`],
-//! submits reads and writes against buffers from the queue's own
-//! [`BufferPool`], and later reaps [`IoCompletion`]s. Buffers are *moved* into
-//! the queue for the duration of the operation and handed back with the
-//! completion, so ownership is always unambiguous and no lifetime crosses the
-//! submission boundary.
+//! A worker thread owns exactly one [`IoQueue`] and drives any number of
+//! engine pipelines through it. A pipeline *attaches* a device to the queue and
+//! receives a [`Descriptor`]: one open of that device on this queue, naming
+//! both the registered file the operations go to and the inbox its completions
+//! are routed to. Buffers are *moved* into the queue for the duration of an
+//! operation and handed back with the completion, so ownership is always
+//! unambiguous and no lifetime crosses the submission boundary.
 //!
-//! Two implementations exist: io_uring with registered fixed buffers (Linux,
-//! the production path) and [`SyncQueue`], which performs each operation
-//! immediately on a blocking device and merely defers the completion. The sync
-//! queue keeps the engine portable and deterministic under test; every piece of
-//! engine logic is identical on both.
+//! Enqueueing never blocks and never touches the device. When `depth`
+//! operations are already in flight the operation is rejected *losslessly*: the
+//! buffer comes back to the caller, who keeps the operation in its own ready
+//! queue and retries after the next poll. [`IoQueue::vacant`] tells a caller
+//! exactly how many operations it can enqueue without a rejection.
+//!
+//! Two implementations exist: io_uring with registered fixed buffers and a
+//! fixed-file table ([`UringQueue`](crate::uring::UringQueue), Linux, the
+//! production path) and [`SyncQueue`], which performs each operation
+//! immediately through the blocking [`Device`] interface and merely defers the
+//! completion. The sync queue keeps the engine portable and deterministic under
+//! test; every piece of engine logic is identical on both.
 
-use std::{collections::VecDeque, io, sync::Arc};
+use std::{io, sync::Arc};
 
 use moat_common::{BufferPool, PoolOptions, PooledBuf};
+
+use crate::device::Device;
 
 /// Configuration of one [`IoQueue`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,8 +48,8 @@ pub struct QueueOptions {
     pub depth: u32,
     /// The buffer pool owned by the queue.
     pub pool: PoolOptions,
-    /// Use the blocking implementation even where io_uring is available.
-    pub force_sync: bool,
+    /// Maximum number of attached descriptors.
+    pub descriptors: u32,
 }
 
 impl Default for QueueOptions {
@@ -47,10 +57,27 @@ impl Default for QueueOptions {
         Self {
             depth: 256,
             pool: PoolOptions::default(),
-            force_sync: false,
+            descriptors: 256,
         }
     }
 }
+
+/// One open of a device on a queue: a registered-file slot plus a completion
+/// inbox. Scoped to the queue that issued it; not the kernel's file descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Descriptor(pub(crate) u32);
+
+impl Descriptor {
+    /// The slot index within the queue.
+    #[inline]
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
+/// The queue has `depth` operations in flight; retry after a poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Full;
 
 /// A finished operation. `buf` is the buffer the operation was issued with
 /// (absent for `fsync`).
@@ -63,49 +90,129 @@ pub struct IoCompletion {
     pub buf: Option<PooledBuf>,
 }
 
-/// An asynchronous I/O queue bound to one device and one thread.
-///
-/// `read`/`write`/`fsync` only enqueue; [`IoQueue::submit`] pushes queued
-/// operations to the device and [`IoQueue::poll`] reaps completions (and
-/// submits first). Enqueueing fails with [`io::ErrorKind::WouldBlock`] when
-/// `depth` operations are already in flight; callers poll and retry.
+/// An asynchronous I/O queue owned by one thread and shared by the pipelines
+/// on it. See the [module docs](self).
 pub trait IoQueue: Send {
     /// The pool every buffer passed to this queue must come from.
     fn pool(&self) -> &Arc<BufferPool>;
 
-    /// Reads `len` bytes at `offset` into the start of `buf`.
-    fn read(&mut self, buf: PooledBuf, len: usize, offset: u64, token: u64) -> io::Result<()>;
+    /// Registers `device` and opens an inbox for it.
+    fn attach(&mut self, device: &Arc<dyn Device>) -> io::Result<Descriptor>;
 
-    /// Writes the first `len` bytes of `buf` at `offset`.
-    fn write(&mut self, buf: PooledBuf, len: usize, offset: u64, token: u64) -> io::Result<()>;
+    /// Closes a descriptor. Completions still in flight for it are discarded
+    /// on arrival (their buffers return to the pool). The slot stays reserved
+    /// until all accepted operations have been reaped.
+    fn detach(&mut self, desc: Descriptor);
 
-    /// Flushes the device's volatile write cache once all previously
-    /// *completed* writes are on the device. Ordering against in-flight writes
-    /// is the caller's responsibility (wait for them first).
-    fn fsync(&mut self, token: u64) -> io::Result<()>;
+    /// Enqueues a read of `len` bytes at `offset` into the start of `buf`.
+    /// Rejected, with the buffer handed back untouched, when `depth`
+    /// operations are in flight.
+    fn read(&mut self, desc: Descriptor, buf: PooledBuf, len: usize, offset: u64, token: u64) -> Result<(), PooledBuf>;
+
+    /// Enqueues a write of the first `len` bytes of `buf` at `offset`.
+    /// Rejected, with the buffer handed back untouched, when `depth`
+    /// operations are in flight.
+    fn write(&mut self, desc: Descriptor, buf: PooledBuf, len: usize, offset: u64, token: u64)
+    -> Result<(), PooledBuf>;
+
+    /// Enqueues a flush of the device's volatile write cache. Ordering against
+    /// in-flight writes is the caller's responsibility (wait for them first).
+    fn fsync(&mut self, desc: Descriptor, token: u64) -> Result<(), Full>;
+
+    /// `depth() - in_flight()`: how many operations can be enqueued right now
+    /// without being rejected.
+    fn vacant(&self) -> usize {
+        self.depth() - self.in_flight()
+    }
 
     /// Pushes enqueued operations to the device without waiting.
     fn submit(&mut self) -> io::Result<()>;
 
-    /// Submits, then collects finished operations into `out`. With `wait` set
-    /// and operations in flight, blocks until at least one completes.
-    fn poll(&mut self, out: &mut Vec<IoCompletion>, wait: bool) -> io::Result<usize>;
+    /// Submits, then reaps every finished operation into its descriptor's
+    /// inbox. With `wait` set and anything in flight, blocks until at least
+    /// one completes. Returns the number reaped. This is a worker's single
+    /// blocking point.
+    fn poll(&mut self, wait: bool) -> io::Result<usize>;
 
-    /// Operations submitted but not yet reaped.
+    /// Moves the inbox of `desc` into `out`. Returns the number moved.
+    fn take(&mut self, desc: Descriptor, out: &mut Vec<IoCompletion>) -> usize;
+
+    /// Operations enqueued but not yet reaped.
     fn in_flight(&self) -> usize;
 
-    /// Maximum operations in flight; enqueueing beyond it fails.
+    /// Maximum operations in flight.
     fn depth(&self) -> usize;
 }
 
-/// The blocking primitives a [`SyncQueue`] is built on.
-pub trait BlockingIo: Send + 'static {
-    /// Reads `buf.len()` bytes at `offset`.
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
-    /// Writes `buf` at `offset`.
-    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
-    /// Flushes the write cache.
-    fn sync(&self) -> io::Result<()>;
+/// Completion inboxes indexed by descriptor, shared by both queue
+/// implementations.
+pub(crate) struct Inboxes {
+    boxes: Vec<Inbox>,
+}
+
+#[derive(Default)]
+struct Inbox {
+    open: bool,
+    pending: usize,
+    done: Vec<IoCompletion>,
+}
+
+impl Inboxes {
+    pub(crate) fn new(capacity: u32) -> Self {
+        Self {
+            boxes: (0..capacity.max(1)).map(|_| Inbox::default()).collect(),
+        }
+    }
+
+    /// Opens the lowest free inbox.
+    pub(crate) fn open(&mut self) -> Option<Descriptor> {
+        let slot = self.boxes.iter().position(|b| !b.open && b.pending == 0)?;
+        self.boxes[slot].open = true;
+        Some(Descriptor(slot as u32))
+    }
+
+    /// Closes the inbox; returns whether its file slot can be released now.
+    pub(crate) fn close(&mut self, desc: Descriptor) -> bool {
+        let Some(b) = self.boxes.get_mut(desc.0 as usize).filter(|b| b.open) else {
+            return false;
+        };
+        b.open = false;
+        b.done.clear();
+        b.pending == 0
+    }
+
+    pub(crate) fn start(&mut self, desc: Descriptor) {
+        let b = &mut self.boxes[desc.0 as usize];
+        assert!(b.open, "operation on a detached descriptor");
+        b.pending += 1;
+    }
+
+    /// Returns whether the last operation of a closed descriptor was reaped.
+    pub(crate) fn deliver(&mut self, desc: Descriptor, done: IoCompletion) -> bool {
+        let b = &mut self.boxes[desc.0 as usize];
+        b.pending -= 1;
+        if b.open {
+            b.done.push(done);
+        }
+        !b.open && b.pending == 0
+    }
+
+    pub(crate) fn take(&mut self, desc: Descriptor, out: &mut Vec<IoCompletion>) -> usize {
+        let Some(b) = self.boxes.get_mut(desc.0 as usize).filter(|b| b.open) else {
+            return 0;
+        };
+        let inbox = &mut b.done;
+        let n = inbox.len();
+        if n == 0 {
+            return 0;
+        }
+        if out.is_empty() {
+            std::mem::swap(inbox, out);
+        } else {
+            out.append(inbox);
+        }
+        n
+    }
 }
 
 /// How a [`SyncQueue`] orders its deferred completions. Reverse order is a
@@ -120,71 +227,123 @@ pub enum CompletionOrder {
     Reverse,
 }
 
-/// An [`IoQueue`] that performs each operation synchronously at submission and
-/// reports the completion on the next poll.
-pub struct SyncQueue<B: BlockingIo> {
-    io: B,
+/// An [`IoQueue`] that performs each operation synchronously at submission
+/// through [`Device::read_at`] / [`Device::write_at`] and reports the
+/// completion on the next poll.
+pub struct SyncQueue {
     pool: Arc<BufferPool>,
     depth: usize,
-    done: VecDeque<IoCompletion>,
+    devices: Vec<Option<Arc<dyn Device>>>,
+    inboxes: Inboxes,
+    /// Operations performed but not yet reaped, in submission order.
+    done: Vec<(Descriptor, IoCompletion)>,
     order: CompletionOrder,
 }
 
-impl<B: BlockingIo> SyncQueue<B> {
-    /// Creates a queue over `io` with a fresh pool.
-    pub fn new(io: B, opts: &QueueOptions, order: CompletionOrder) -> io::Result<Self> {
+impl SyncQueue {
+    /// Creates a queue with a fresh pool owned by the calling thread.
+    pub fn new(opts: &QueueOptions, order: CompletionOrder) -> io::Result<Self> {
         Ok(Self {
-            io,
             pool: BufferPool::new(opts.pool)?,
             depth: opts.depth.max(1) as usize,
-            done: VecDeque::new(),
+            devices: (0..opts.descriptors.max(1)).map(|_| None).collect(),
+            inboxes: Inboxes::new(opts.descriptors),
+            done: Vec::new(),
             order,
         })
     }
 
-    fn check_capacity(&self) -> io::Result<()> {
-        if self.done.len() >= self.depth {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "queue full"));
-        }
-        Ok(())
+    fn device(&self, desc: Descriptor) -> &Arc<dyn Device> {
+        self.devices
+            .get(desc.0 as usize)
+            .and_then(Option::as_ref)
+            .expect("operation on a detached descriptor")
     }
 }
 
-impl<B: BlockingIo> IoQueue for SyncQueue<B> {
+impl IoQueue for SyncQueue {
     fn pool(&self) -> &Arc<BufferPool> {
         &self.pool
     }
 
-    fn read(&mut self, mut buf: PooledBuf, len: usize, offset: u64, token: u64) -> io::Result<()> {
-        self.check_capacity()?;
-        let result = self.io.read_at(&mut buf[..len], offset).map(|()| len);
-        self.done.push_back(IoCompletion {
-            token,
-            result,
-            buf: Some(buf),
-        });
+    fn attach(&mut self, device: &Arc<dyn Device>) -> io::Result<Descriptor> {
+        let desc = self
+            .inboxes
+            .open()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "no free descriptor"))?;
+        self.devices[desc.0 as usize] = Some(device.clone());
+        Ok(desc)
+    }
+
+    fn detach(&mut self, desc: Descriptor) {
+        self.inboxes.close(desc);
+        if let Some(d) = self.devices.get_mut(desc.0 as usize) {
+            *d = None;
+        }
+    }
+
+    fn read(
+        &mut self,
+        desc: Descriptor,
+        mut buf: PooledBuf,
+        len: usize,
+        offset: u64,
+        token: u64,
+    ) -> Result<(), PooledBuf> {
+        if self.done.len() >= self.depth {
+            return Err(buf);
+        }
+        let result = self.device(desc).read_at(&mut buf[..len], offset).map(|()| len);
+        self.inboxes.start(desc);
+        self.done.push((
+            desc,
+            IoCompletion {
+                token,
+                result,
+                buf: Some(buf),
+            },
+        ));
         Ok(())
     }
 
-    fn write(&mut self, buf: PooledBuf, len: usize, offset: u64, token: u64) -> io::Result<()> {
-        self.check_capacity()?;
-        let result = self.io.write_at(&buf[..len], offset).map(|()| len);
-        self.done.push_back(IoCompletion {
-            token,
-            result,
-            buf: Some(buf),
-        });
+    fn write(
+        &mut self,
+        desc: Descriptor,
+        buf: PooledBuf,
+        len: usize,
+        offset: u64,
+        token: u64,
+    ) -> Result<(), PooledBuf> {
+        if self.done.len() >= self.depth {
+            return Err(buf);
+        }
+        let result = self.device(desc).write_at(&buf[..len], offset).map(|()| len);
+        self.inboxes.start(desc);
+        self.done.push((
+            desc,
+            IoCompletion {
+                token,
+                result,
+                buf: Some(buf),
+            },
+        ));
         Ok(())
     }
 
-    fn fsync(&mut self, token: u64) -> io::Result<()> {
-        self.check_capacity()?;
-        let result = self.io.sync().map(|()| 0);
-        self.done.push_back(IoCompletion {
-            token,
-            result,
-            buf: None,
-        });
+    fn fsync(&mut self, desc: Descriptor, token: u64) -> Result<(), Full> {
+        if self.done.len() >= self.depth {
+            return Err(Full);
+        }
+        let result = self.device(desc).sync().map(|()| 0);
+        self.inboxes.start(desc);
+        self.done.push((
+            desc,
+            IoCompletion {
+                token,
+                result,
+                buf: None,
+            },
+        ));
         Ok(())
     }
 
@@ -192,13 +351,19 @@ impl<B: BlockingIo> IoQueue for SyncQueue<B> {
         Ok(())
     }
 
-    fn poll(&mut self, out: &mut Vec<IoCompletion>, _wait: bool) -> io::Result<usize> {
+    fn poll(&mut self, _wait: bool) -> io::Result<usize> {
         let n = self.done.len();
-        match self.order {
-            CompletionOrder::Fifo => out.extend(self.done.drain(..)),
-            CompletionOrder::Reverse => out.extend(self.done.drain(..).rev()),
+        if self.order == CompletionOrder::Reverse {
+            self.done.reverse();
+        }
+        for (desc, done) in self.done.drain(..) {
+            self.inboxes.deliver(desc, done);
         }
         Ok(n)
+    }
+
+    fn take(&mut self, desc: Descriptor, out: &mut Vec<IoCompletion>) -> usize {
+        self.inboxes.take(desc, out)
     }
 
     fn in_flight(&self) -> usize {
@@ -207,5 +372,71 @@ impl<B: BlockingIo> IoQueue for SyncQueue<B> {
 
     fn depth(&self) -> usize {
         self.depth
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use moat_common::HugePages;
+
+    use super::*;
+    use crate::device::MemDevice;
+
+    pub(crate) fn check_detach(q: &mut dyn IoQueue, a: Arc<dyn Device>, b: Arc<dyn Device>) {
+        let old = q.attach(&a).unwrap();
+        let mut buf = q.pool().alloc(4096).unwrap();
+        buf[..4096].fill(1);
+        q.write(old, buf, 4096, 0, 1).unwrap();
+        // Detach before submit: the fixed-file binding must survive staging.
+        q.detach(old);
+        let new = q.attach(&b).unwrap();
+        assert_ne!(old, new, "an outstanding operation still owns the old slot");
+        assert!(q.attach(&a).is_err(), "both descriptor slots are reserved");
+        let mut buf = q.pool().alloc(4096).unwrap();
+        buf[..4096].fill(2);
+        q.write(new, buf, 4096, 0, 2).unwrap();
+        while q.in_flight() > 0 {
+            q.poll(true).unwrap();
+        }
+        let mut done = Vec::new();
+        assert_eq!(q.take(old, &mut done), 0);
+        assert_eq!(q.take(new, &mut done), 1);
+        let completion = done.pop().unwrap();
+        assert_eq!(completion.token, 2);
+        assert_eq!(completion.result.unwrap(), 4096);
+        drop(completion.buf);
+        let mut bytes = [0; 4096];
+        a.read_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [1; 4096]);
+        b.read_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [2; 4096]);
+        assert_eq!(q.attach(&a).unwrap(), old, "completed slots can be reused");
+        q.detach(old);
+        q.detach(new);
+        assert_eq!(q.pool().in_use(), 0);
+    }
+
+    pub(crate) fn detach_options() -> QueueOptions {
+        QueueOptions {
+            depth: 4,
+            descriptors: 2,
+            pool: PoolOptions {
+                bytes: 1 << 20,
+                max_class: 64 << 10,
+                huge_pages: HugePages::Disabled,
+            },
+        }
+    }
+
+    #[test]
+    fn detached_descriptors_wait_for_outstanding_completions() {
+        for order in [CompletionOrder::Fifo, CompletionOrder::Reverse] {
+            let mut queue = SyncQueue::new(&detach_options(), order).unwrap();
+            check_detach(
+                &mut queue,
+                Arc::new(MemDevice::new(4096)),
+                Arc::new(MemDevice::new(4096)),
+            );
+        }
     }
 }

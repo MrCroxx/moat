@@ -19,7 +19,7 @@
 
 use std::{hint::black_box, time::Instant};
 
-use moat_common::{CHECKSUM_BLOCK_SIZE, block_checksums, crc32c};
+use moat_common::{CHECKSUM_BLOCK_SIZE, block_checksums, crc32c, verify_blocks};
 
 fn median_gib_per_s(len: usize, mut f: impl FnMut()) -> f64 {
     let passes = (2usize << 30) / len.max(1);
@@ -42,7 +42,10 @@ fn main() {
     let sizes = [4 << 10, CHECKSUM_BLOCK_SIZE, 1 << 20, 4 << 20];
     let buf: Vec<u8> = (0..(4usize << 20)).map(|i| (i % 251) as u8).collect();
 
-    println!("{:>10} {:>16} {:>22}", "size", "crc32c GiB/s", "block_checksums GiB/s");
+    println!(
+        "{:>10} {:>16} {:>22} {:>20}",
+        "size", "crc32c GiB/s", "block_checksums GiB/s", "verify_blocks GiB/s"
+    );
     for &len in &sizes {
         let data = &buf[..len];
         let one_shot = median_gib_per_s(len, || {
@@ -51,6 +54,10 @@ fn main() {
         let per_block = median_gib_per_s(len, || {
             black_box(block_checksums(black_box(data)));
         });
-        println!("{:>10} {:>16.2} {:>22.2}", len, one_shot, per_block);
+        let checksums = block_checksums(data);
+        let verify = median_gib_per_s(len, || {
+            black_box(verify_blocks(black_box(data), 0, black_box(&checksums))).unwrap();
+        });
+        println!("{:>10} {:>16.2} {:>22.2} {:>20.2}", len, one_shot, per_block, verify);
     }
 }

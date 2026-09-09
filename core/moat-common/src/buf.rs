@@ -25,8 +25,8 @@ use crate::align::PAGE_SIZE;
 /// A zero-initialised heap buffer whose address and length are both multiples
 /// of [`PAGE_SIZE`].
 ///
-/// This is the only buffer type that may be handed to a direct I/O device or
-/// registered with an RDMA NIC.
+/// Used for blocking direct I/O during formatting and recovery. Asynchronous
+/// queues use [`PooledBuf`](crate::PooledBuf) from registered arenas.
 pub struct AlignedBuf {
     ptr: NonNull<u8>,
     len: usize,
