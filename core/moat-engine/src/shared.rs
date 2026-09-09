@@ -99,13 +99,4 @@ impl Shared {
             record_count: 0,
         }
     }
-
-    pub(crate) fn now(&self) -> u64 {
-        self.options.clock.now_secs()
-    }
-
-    /// Whether a record with the given expiry is expired at the current time.
-    pub(crate) fn is_expired(&self, expire_at: u64) -> bool {
-        expire_at != 0 && self.now() >= expire_at
-    }
 }

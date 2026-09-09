@@ -20,6 +20,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use moat_common::{AlignedBuf, ChunkId, PAGE_SIZE};
@@ -34,7 +35,7 @@ use crate::{
         SUPERBLOCK_LEN, SegmentHeader, SegmentKind, SegmentState, Superblock, decode_footer, encode_footer, footer_len,
         large_batch_len,
     },
-    options::{Clock, FormatOptions, Options, SystemClock},
+    options::{FormatOptions, Options},
     reader::Reader,
     scan::{parse_batch, scan_batches_blocking},
     segments::{Geometry, SegmentTable},
@@ -59,7 +60,10 @@ pub fn format(device: &dyn Device, opts: &FormatOptions) -> Result<()> {
         segment_size: opts.segment_size,
         chunk_max: opts.chunk_max,
         segment_count: geometry.segment_count,
-        created_at: SystemClock.now_secs(),
+        created_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
     };
 
     let mut page = AlignedBuf::zeroed(SEGMENT_HEADER_LEN as usize);
@@ -165,8 +169,7 @@ pub struct Engine {
 impl Engine {
     /// Returns metadata about a chunk without touching the disk.
     ///
-    /// Expiry is not evaluated here; an expired chunk still reports its stat
-    /// until reclaim drops it. Management path: a thread that reads regularly
+    /// Management path: a thread that reads regularly
     /// should use [`Reader::stat`] instead.
     pub fn stat(&self, id: &ChunkId) -> Option<ChunkStat> {
         self.shared

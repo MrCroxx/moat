@@ -74,9 +74,9 @@ use crate::{
     index::{IndexValue, IndexWriter, InsertOutcome, Location, flags_from_record},
     io::{Descriptor, IoCompletion, IoQueue},
     layout::{
-        BATCH_HEADER_LEN, BatchHeader, BatchKind, FooterEntry, RECORD_ALIGN, RECORD_FLAG_EXPIRES, RECORD_FLAG_FRAMED,
-        RECORD_FLAG_LARGE, RecordGeometry, RecordHeader, RecordKind, SEGMENT_HEADER_LEN, SegmentHeader, SegmentKind,
-        SegmentState, encode_footer, footer_len, large_batch_len, large_value_offset, prefer_framed, record_meta_len,
+        BATCH_HEADER_LEN, BatchHeader, BatchKind, FooterEntry, RECORD_ALIGN, RECORD_FLAG_FRAMED, RECORD_FLAG_LARGE,
+        RecordGeometry, RecordHeader, RecordKind, SEGMENT_HEADER_LEN, SegmentHeader, SegmentKind, SegmentState,
+        encode_footer, footer_len, large_batch_len, large_value_offset, prefer_framed, record_meta_len,
     },
     scan::{BatchStep, max_batch_len, next_batch, parse_batch},
     shared::Shared,
@@ -99,9 +99,6 @@ pub struct PutOptions {
     /// default) a put of an existing identifier returns
     /// [`PutOutcome::Exists`] without writing anything.
     pub overwrite: bool,
-    /// Unix time (seconds) after which the chunk reads as missing and reclaim
-    /// drops it. Zero means never.
-    pub expire_at: u64,
 }
 
 /// Result of a `put`.
@@ -189,7 +186,7 @@ pub struct ReclaimReport {
     pub records: u64,
     /// Live data records copied to a cold segment.
     pub relocated: u64,
-    /// Data records dropped (dead, expired, or evicted).
+    /// Data records dropped (dead or evicted).
     pub dropped: u64,
     /// Tombstones copied forward because an older version might still exist.
     pub tombstones_relocated: u64,
@@ -633,36 +630,29 @@ fn batch_slot(kind: BatchKind) -> usize {
 }
 
 /// Chooses how a small (below the pack threshold) value is stored.
-fn small_batch_kind(value_len: u32, expire_at: u64) -> BatchKind {
-    // Expiring records always read their header for TTL; keep it adjacent to
-    // the value so those reads do not span a separate framed header area.
-    if expire_at == 0 && prefer_framed(value_len) {
+fn small_batch_kind(value_len: u32) -> BatchKind {
+    if prefer_framed(value_len) {
         BatchKind::Framed
     } else {
         BatchKind::Inline
     }
 }
 
-fn record_flags(batch: BatchKind, expire_at: u64) -> u8 {
-    let mut flags = match batch {
+fn record_flags(batch: BatchKind) -> u8 {
+    match batch {
         BatchKind::Large => RECORD_FLAG_LARGE,
         BatchKind::Framed => RECORD_FLAG_FRAMED,
         BatchKind::Inline => 0,
-    };
-    if expire_at != 0 {
-        flags |= RECORD_FLAG_EXPIRES;
     }
-    flags
 }
 
-fn header(kind: RecordKind, flags: u8, value_len: u32, lsn: Lsn, key: ChunkId, expire_at: u64) -> RecordHeader {
+fn header(kind: RecordKind, flags: u8, value_len: u32, lsn: Lsn, key: ChunkId) -> RecordHeader {
     RecordHeader {
         kind,
         flags,
         value_len,
         lsn,
         key,
-        expire_at,
     }
 }
 
@@ -750,8 +740,8 @@ impl Writer {
             large.value_mut().copy_from_slice(value);
             self.ensure_room(q, SegmentKind::Hot, large_batch_len(len), 1)?;
             let (ticket, lsn) = self.next_ids();
-            let flags = record_flags(BatchKind::Large, opts.expire_at);
-            let hdr = header(RecordKind::Data, flags, len, lsn, id, opts.expire_at);
+            let flags = record_flags(BatchKind::Large);
+            let hdr = header(RecordKind::Data, flags, len, lsn, id);
             self.write_large(
                 q,
                 SegmentKind::Hot,
@@ -763,11 +753,11 @@ impl Writer {
             );
             Ok(PutOutcome::Written { ticket, lsn })
         } else {
-            let batch = small_batch_kind(len, opts.expire_at);
+            let batch = small_batch_kind(len);
             self.reserve_small(q, SegmentKind::Hot, batch, value.len())?;
             let (ticket, lsn) = self.next_ids();
-            let flags = record_flags(batch, opts.expire_at);
-            let hdr = header(RecordKind::Data, flags, len, lsn, id, opts.expire_at);
+            let flags = record_flags(batch);
+            let hdr = header(RecordKind::Data, flags, len, lsn, id);
             self.append_small(
                 q,
                 SegmentKind::Hot,
@@ -835,8 +825,8 @@ impl Writer {
         };
         self.ensure_room(q, SegmentKind::Hot, large_batch_len(value.len()), 1)?;
         let (ticket, lsn) = self.next_ids();
-        let flags = record_flags(BatchKind::Large, opts.expire_at);
-        let hdr = header(RecordKind::Data, flags, value.len(), lsn, id, opts.expire_at);
+        let flags = record_flags(BatchKind::Large);
+        let hdr = header(RecordKind::Data, flags, value.len(), lsn, id);
         self.write_large(
             q,
             SegmentKind::Hot,
@@ -867,7 +857,7 @@ impl Writer {
         }
         let (ticket, lsn) = self.next_ids();
         self.deleted.insert(*id, Tombstone { lsn, applied: false });
-        let hdr = header(RecordKind::Tombstone, 0, 0, lsn, *id, 0);
+        let hdr = header(RecordKind::Tombstone, 0, 0, lsn, *id);
         self.append_small(
             q,
             SegmentKind::Hot,
@@ -2099,7 +2089,6 @@ impl Writer {
                 // it is dropped rather than copied forward.
                 let intact = verify_blocks_with(value, 0, |b| checksums.get(b as usize).copied()).is_ok();
                 let keep = intact
-                    && !self.shared.is_expired(hdr.expire_at)
                     && match policy {
                         ReclaimPolicy::Storage => true,
                         ReclaimPolicy::Cache { reinsert_accessed } => reinsert_accessed && current.is_accessed(),
@@ -2120,14 +2109,14 @@ impl Writer {
                     let mut large = self.prepare_large(q, hdr.value_len)?;
                     self.ensure_room(q, SegmentKind::Cold, large_batch_len(hdr.value_len), 1)?;
                     large.value_mut().copy_from_slice(value);
-                    let flags = record_flags(BatchKind::Large, hdr.expire_at);
-                    let new = header(RecordKind::Data, flags, hdr.value_len, hdr.lsn, hdr.key, hdr.expire_at);
+                    let flags = record_flags(BatchKind::Large);
+                    let new = header(RecordKind::Data, flags, hdr.value_len, hdr.lsn, hdr.key);
                     self.write_large(q, SegmentKind::Cold, &new, checksums, large.buf, apply, None);
                 } else {
-                    let batch = small_batch_kind(hdr.value_len, hdr.expire_at);
+                    let batch = small_batch_kind(hdr.value_len);
                     self.reserve_small(q, SegmentKind::Cold, batch, value.len())?;
-                    let flags = record_flags(batch, hdr.expire_at);
-                    let new = header(RecordKind::Data, flags, hdr.value_len, hdr.lsn, hdr.key, hdr.expire_at);
+                    let flags = record_flags(batch);
+                    let new = header(RecordKind::Data, flags, hdr.value_len, hdr.lsn, hdr.key);
                     self.append_small(q, SegmentKind::Cold, batch, &new, checksums, value, apply, None);
                 }
                 let report = &mut self.reclaim.as_mut().expect("job exists").report;
@@ -2143,7 +2132,7 @@ impl Writer {
                     self.reclaim.as_mut().expect("job exists").report.tombstones_dropped += 1;
                 } else {
                     self.reserve_small(q, SegmentKind::Cold, BatchKind::Inline, 0)?;
-                    let new = header(RecordKind::Tombstone, 0, 0, hdr.lsn, hdr.key, 0);
+                    let new = header(RecordKind::Tombstone, 0, 0, hdr.lsn, hdr.key);
                     self.append_small(
                         q,
                         SegmentKind::Cold,
@@ -2177,11 +2166,12 @@ mod tests {
 
     #[test]
     fn short_auxiliary_io_fails_without_reclaiming_live_data() {
+        use moat_common::{HugePages, PoolOptions};
+
         use crate::{
             FormatOptions, MemDevice, Options, QueueOptions, blocking,
             io::{CompletionOrder, SyncQueue},
         };
-        use moat_common::{HugePages, PoolOptions};
 
         for reclaim in [false, true] {
             let device = Arc::new(MemDevice::new(5 << 20));
@@ -2247,8 +2237,7 @@ mod tests {
     #[test]
     fn framing_decision_for_near_page_multiples() {
         assert!(prefer_framed(40942));
-        assert_eq!(small_batch_kind(40942, 0), BatchKind::Framed);
-        assert_eq!(small_batch_kind(40942, 5), BatchKind::Inline);
-        assert_eq!(small_batch_kind(5000, 0), BatchKind::Inline);
+        assert_eq!(small_batch_kind(40942), BatchKind::Framed);
+        assert_eq!(small_batch_kind(5000), BatchKind::Inline);
     }
 }

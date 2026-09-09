@@ -346,7 +346,7 @@ impl Load {
             self.read_free.push(slot);
             self.read_outstanding -= 1;
             debug_assert_eq!(d, disk);
-            let data = c.result.unwrap().expect("not expired");
+            let data = c.result.unwrap();
             debug_assert_eq!(data.len(), len);
             if let Some(started) = started {
                 self.hist.record(started.elapsed());

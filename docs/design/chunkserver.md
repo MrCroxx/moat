@@ -44,7 +44,7 @@
 ### 1.2 Assumptions added by this document
 
 - **Hardware baseline**: PCIe 5 NVMe (~10 GB/s sequential read, ~5–7 GB/s write per disk), 4–8 × 400 Gb/s RDMA NICs (~46 GB/s usable each), 96+ cores, multiple NUMA nodes. 24 disks aggregate to 150–200 GB/s, matching four 400G NICs.
-- **Semantic baseline**: the chunkserver is a **single-node, durable, correct** chunk store. Once a PUT is acknowledged it must be readable after a restart unless the disk fails; the engine must **never return wrong data** (it returns MISS or CORRUPT instead). Cache semantics (eviction, TTL) are a **policy switch** on top of the engine, not a second engine.
+- **Semantic baseline**: the chunkserver is a **single-node, durable, correct** chunk store. Once a PUT is acknowledged it must be readable after a restart unless the disk fails; the engine must **never return wrong data** (it returns MISS or CORRUPT instead). Cache eviction is a **policy switch** on top of the engine, not a second engine.
 - **Enterprise drives have power-loss protection**; by default no flush is issued on the data path. A `sync_mode` option exists for drives without it.
 - **Replication is not inside the chunkserver**: replicas, erasure coding or chain replication are built above it (client-side multi-write or a separate replication layer). The engine exposes `lsn` and `if_absent` primitives so that layer can replay idempotently (see §11).
 
@@ -52,6 +52,7 @@
 
 - POSIX file semantics; partial overwrite inside a chunk (emulate with read-modify-write of a new version at the client).
 - Server-side range listing or prefix scans.
+- 对象 TTL 和生命周期由上层管理；chunkserver 通过显式删除和 GC 回收数据，不按时间使 chunk 过期。
 - Multi-tenancy isolation and encryption (flag bits are reserved in the protocol; not in v0).
 
 ---
@@ -82,14 +83,13 @@ pub struct ChunkId(pub [u8; 16]);          // opaque to the chunkserver
 pub struct PutOptions {
     pub overwrite: bool,      // false: an existing id returns Exists (immutable semantics, default)
                               // true: the new version replaces the old one
-    pub expire_at: u64,       // cache-mode TTL in seconds since the epoch; 0 = never
 }
 
 // server semantics
 put(id, value, block_crcs, opts) -> Ok { lsn } | Exists | Throttle | NoSpace | Err
 get(id, offset, len)               -> Ok { total_len, data } | Miss | Corrupt | Throttle | Err
 delete(id)                         -> Ok | Miss
-stat(id)                           -> Ok { len, lsn, expire_at } | Miss
+stat(id)                           -> Ok { len, lsn } | Miss
 ```
 
 - **Immutable by default**: a repeated PUT of the same id returns `Exists`, which clients treat as success (naturally idempotent). With `overwrite = true` the new record supersedes the old one, which GC collects later.
@@ -155,7 +155,7 @@ struct RecordHdr {          // 64 B; crc covers the rest of the header + block_c
     value_len: u32, block_count: u32,
     lsn: u64,
     key: ChunkId,           // 16 B
-    expire_at: u64,
+    reserved: [u8; 16],
 }
 // followed by block_crcs: [u32; block_count]  (CRC32C per 64 KiB)
 ```
@@ -164,7 +164,7 @@ struct RecordHdr {          // 64 B; crc covers the rest of the header + block_c
 - In a large batch the value starts on the first page boundary after the headers, so the on-disk layout matches the RDMA landing buffer (the client writes to `buf + header_len`) and the batch goes to disk **without a copy**.
 - Fixed overhead per record: 64 B + 4 B per 64 KiB. A large record also pays its header page(s) and tail padding (≈ 0.15% at 4 MiB, ≈ 9% at 64 KiB — hence packing below 64 KiB).
 - A tombstone is a record with `value_len = 0, kind = Tombstone`; it goes into a packed batch and is essentially free.
-- **Page layout for small values.** Inline records are aligned to eight bytes and moved to the next page when necessary to reduce page crossings. Values near a page multiple use a framed layout with grouped headers and page-aligned values. By default, readers use the index to read the requested value pages without a separate header; expiring records still read and validate the header. Enabling `verify_reads` expands the read to the complete checksum blocks touched by the range and includes the record header and checksum array. The index no longer caches a single-block CRC.
+- **Page layout for small values.** Inline records are aligned to eight bytes and moved to the next page when necessary to reduce page crossings. Values near a page multiple use a framed layout with grouped headers and page-aligned values. By default, readers use the index to read the requested value pages without a separate header. Enabling `verify_reads` expands the read to the complete checksum blocks touched by the range and includes the record header and checksum array. The index no longer caches a single-block CRC.
 
 ### 4.3 Write pipeline: one writer per disk
 
@@ -198,7 +198,7 @@ struct Entry {                 // 48 B
     key: ChunkId,              // 16 B
     seg_no: u32, offset: u32,  // location of the record header
     value_off: u32,            // location of the value (differs from the header for framed records)
-    value_len: u32, flags: u32,// LARGE, FRAMED, EXPIRES, ACCESSED
+    value_len: u32, flags: u32,// LARGE, FRAMED, ACCESSED
     crc: u32,                  // CRC32C of the first checksum block: verifies framed reads without the header
     lsn: u64,                  // recovery ordering + external version token
 }
@@ -216,7 +216,7 @@ struct Entry {                 // 48 B
 3. Append a 64 B tombstone (`kind = Tombstone`, fresh lsn) to the current packed batch.
 4. **Acknowledge only after that batch's completion**: a delete means "gone after a crash too"; acknowledging after the in-memory removal alone would let recovery resurrect the old record. Latency is one 4 KiB write plus two messages (~20–40 µs on a PLP drive); a 4 KiB page holds 60+ tombstones.
 
-Data is not touched; space is reclaimed asynchronously. A worker mid-read has pinned the segment (§4.4) and is unaffected. `overwrite = true` needs no tombstone (the higher-lsn data record supersedes the old one). TTL expiry is not a delete: a GET that sees an expired record returns `Miss` and posts a "lazy index removal" to the owner over the forwarding ring; no tombstone is written, and recovery drops expired records on load.
+Data is not touched; space is reclaimed asynchronously. A worker mid-read has pinned the segment (§4.4) and is unaffected. `overwrite = true` needs no tombstone (the higher-lsn data record supersedes the old one).
 
 **GC runs on the owner worker as a state machine advanced by `Writer::poll`, in small steps interleaved with foreground work**, not on its own thread, so it is serialised with PUT/Del by construction and needs no CAS. The reclaim procedure is identical in storage and cache mode:
 
@@ -235,7 +235,7 @@ pick_victim() → sequential read of the whole segment (io_uring, rate limited) 
 | Mode | `pick_victim` | `decide` |
 |---|---|---|
 | Storage | Trigger: free segments < 10%. Greedy: lowest live ratio; plus a forced pick of the oldest segment when it exceeds an age threshold or total tombstone volume exceeds a threshold (bounds tombstone lifetime) | Live → Relocate |
-| Cache | Trigger: free segments below a low-water mark (with hysteresis). FIFO: oldest segment | `ACCESSED` bit set → Relocate to Cold and clear the bit (S3-FIFO / SIEVE style reinsertion, ratio cap configurable); otherwise Drop; expired → Drop |
+| Cache | Trigger: free segments below a low-water mark (with hysteresis). FIFO: oldest segment | `ACCESSED` bit set → Relocate to Cold and clear the bit (S3-FIFO / SIEVE style reinsertion, ratio cap configurable); otherwise Drop |
 
 Reclaim mechanics:
 
@@ -275,7 +275,7 @@ Cost: headers 120 MB + footers ≈ index volume (48 B × records; 8 million ≈ 
    - A low-priority thread per disk copies the hash table in 1 MiB slices (readers are never blocked; a slice whose entries changed underneath, detected through the per-slot sequence numbers, is re-copied), memcpy to staging, then `WriteFixed` into `kind = Index` segments. The writer is never stalled; p99 is untouched.
    - After all slices complete, superblock A/B flips to the new image (with `L0`, replay start positions, the segment table, table capacity, hasher seed, per-slice CRCs); the old image's segments are freed.
    - Recovery: read the image straight into table memory (zero hashing, 21 GB ≈ 2 s); scan the two active segments from the recorded positions and every segment with `seg_seq` above the checkpoint's maximum; replay only records with `lsn ≥ L0`, merging with the image by **highest lsn** (image entries carry their lsn); drop entries pointing at `Free` segments or at segments whose `seg_seq` differs from the checkpoint's table (can be done lazily on read).
-   - Correctness: every index change after T0 is either a record with `lsn ≥ L0` (inserts, overwrites, relocations — taking the *lowest in-flight* lsn is what keeps in-flight writes' late index updates inside the replay range; a delete's index removal and its tombstone lsn are assigned in the same job, so the tombstone has `lsn ≥ L0`), or has no record at all — only cache-mode Drop eviction (caught by the segment-table check; if the segment has not been reused the entry comes back as live, harmless for a cache) and lazy TTL removal (re-evaluated on read). Slices are copied under the lock, so no torn entries.
+   - Correctness: every index change after T0 is either a record with `lsn ≥ L0` (inserts, overwrites, relocations — taking the *lowest in-flight* lsn is what keeps in-flight writes' late index updates inside the replay range; a delete's index removal and its tombstone lsn are assigned in the same job, so the tombstone has `lsn ≥ L0`), or has no record at all — only cache-mode Drop eviction (caught by the segment-table check; if the segment has not been reused the entry comes back as live, harmless for a cache). Slices are copied under the lock, so no torn entries.
    - Trigger: footer bytes written since the last checkpoint reach 10% of the image size (bounding replay to one tenth of a full rebuild), or a time limit, whichever first. At worst-case scale a checkpoint every 10 minutes is ~35 MB/s per disk (0.7% of write bandwidth, 0.1 DWPD); two images occupy 0.14% of the disk. At typical scale these are two orders of magnitude smaller.
    - The gain only shows when the index is very large (worst case 10–20 s → 3–4 s; typical scale barely changes), hence phase two. A clean-shutdown image is a special case (`L0` = next lsn, empty replay); the two share one mechanism.
 
@@ -284,7 +284,7 @@ Each disk recovers and comes online independently; a slow disk does not block th
 ### 4.7 Durability and consistency summary
 
 - PUT acknowledged ⇔ the completion of the record's batch `WriteFixed` has returned (durable on a PLP drive). With `sync_mode = fdatasync_per_batch` an `IORING_OP_FSYNC(DATASYNC)` follows each batch.
-- **Read verification is optional and disabled by default.** With `Options::verify_reads = true`, each read validates `RecordHdr.magic/crc`, key, LSN, value length and record kind, then verifies every 64 KiB checksum block touched by the requested range; failures return `Corrupt`. With verification disabled, readers rely on the index and segment pin to keep the location valid without scanning the payload. Expiring records still read and validate the header for TTL. Stored checksums and recovery/reclaim validation are unchanged. End-to-end client verification and checksum transport remain future network-layer work.
+- **Read verification is optional and disabled by default.** With `Options::verify_reads = true`, each read validates `RecordHdr.magic/crc`, key, LSN, value length and record kind, then verifies every 64 KiB checksum block touched by the requested range; failures return `Corrupt`. With verification disabled, readers rely on the index and segment pin to keep the location valid without scanning the payload. Stored checksums and recovery/reclaim validation are unchanged. End-to-end client verification and checksum transport remain future network-layer work.
 - A crash can only lose unacknowledged writes; "acknowledged but unreadable" cannot happen short of media failure.
 - No partial writes inside a chunk → no COW, no chunk locks, no fragment merging.
 
@@ -368,7 +368,7 @@ Fixed 32 B header + type-specific body, `bytemuck` POD, little endian; DMA'd fir
 
 | Message | Direction | Body |
 |---|---|---|
-| `Put` | C→S | `id, len, flags, expire_at, block_crcs[]`, value inline when `len ≤ INLINE_MAX` |
+| `Put` | C→S | `id, len, flags, block_crcs[]`, value inline when `len ≤ INLINE_MAX` |
 | `PutGrant` | S→C | `addr, rkey` (value start = landing buffer + header length) |
 | `PutResp` | S→C | `status, lsn` |
 | `Get` | C→S | `id, offset, len` |
@@ -554,4 +554,4 @@ Known trade-offs and extension points:
 2. `moat-server` with TCP transport + `moat-client` over TCP: end-to-end usable, developable and testable on machines without RDMA. *(the node layer without a transport is done: `core/moat-server` has NVMe discovery by serial, rendezvous placement, the pinned worker with one io_uring queue per worker and a pluggable request `Handler`, parallel recovery and owner assignment, and a whole-node benchmark; the TCP transport is the next `Handler`)*
 3. `moat-verbs` + `moat-transport::rdma`: reactor, endpoints, leases/fencing; drive to line rate with `moat-tools bench`.
 4. Multi-disk: NVMe discovery, placement, layout epochs, admission.
-5. Cache-mode policies, TTL, `fsck`, observability.
+5. Cache-mode policies, `fsck`, observability.

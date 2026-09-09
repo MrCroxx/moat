@@ -56,21 +56,16 @@ pub(crate) const FLAG_DEAD: u32 = 4;
 /// Index flag: the record lives in a framed batch (header separate from the
 /// page-aligned value).
 pub const FLAG_FRAMED: u32 = 8;
-/// Index flag: the record carries an expiry time in its header.
-pub const FLAG_EXPIRES: u32 = 16;
 
 /// Translates on-disk record flags into index flags.
 pub(crate) fn flags_from_record(record_flags: u8) -> u32 {
-    use crate::layout::{RECORD_FLAG_EXPIRES, RECORD_FLAG_FRAMED, RECORD_FLAG_LARGE};
+    use crate::layout::{RECORD_FLAG_FRAMED, RECORD_FLAG_LARGE};
     let mut flags = 0;
     if record_flags & RECORD_FLAG_LARGE != 0 {
         flags |= FLAG_LARGE;
     }
     if record_flags & RECORD_FLAG_FRAMED != 0 {
         flags |= FLAG_FRAMED;
-    }
-    if record_flags & RECORD_FLAG_EXPIRES != 0 {
-        flags |= FLAG_EXPIRES;
     }
     flags
 }
@@ -113,12 +108,6 @@ impl IndexValue {
         self.flags & FLAG_FRAMED != 0
     }
 
-    /// Whether the record has an expiry time.
-    #[inline]
-    pub fn expires(&self) -> bool {
-        self.flags & FLAG_EXPIRES != 0
-    }
-
     /// Whether the record has been read since written or relocated.
     #[inline]
     pub fn is_accessed(&self) -> bool {
@@ -129,16 +118,13 @@ impl IndexValue {
     /// accounting.
     #[inline]
     pub(crate) fn record_flags(&self) -> u8 {
-        use crate::layout::{RECORD_FLAG_EXPIRES, RECORD_FLAG_FRAMED, RECORD_FLAG_LARGE};
+        use crate::layout::{RECORD_FLAG_FRAMED, RECORD_FLAG_LARGE};
         let mut flags = 0;
         if self.is_large() {
             flags |= RECORD_FLAG_LARGE;
         }
         if self.is_framed() {
             flags |= RECORD_FLAG_FRAMED;
-        }
-        if self.expires() {
-            flags |= RECORD_FLAG_EXPIRES;
         }
         flags
     }

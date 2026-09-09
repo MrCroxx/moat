@@ -224,7 +224,7 @@ fn read_loop(
         reader.poll(q, &mut out).unwrap();
         for c in out.drain(..) {
             let slot = c.token as usize;
-            let data = c.result.unwrap().expect("not expired");
+            let data = c.result.unwrap();
             assert_eq!(data.len(), len);
             black_box(&*data);
             if let Some(t) = started[slot].take() {

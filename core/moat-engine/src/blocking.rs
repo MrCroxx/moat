@@ -97,7 +97,7 @@ pub fn get(q: &mut dyn IoQueue, r: &mut Reader, id: &ChunkId, range: Option<Rang
     loop {
         r.poll(q, &mut out)?;
         if let Some(pos) = out.iter().position(|c| c.token == TOKEN) {
-            return out.swap_remove(pos).result;
+            return out.swap_remove(pos).result.map(Some);
         }
         q.poll(true)?;
     }

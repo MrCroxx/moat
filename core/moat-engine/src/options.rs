@@ -14,14 +14,6 @@
 
 //! Runtime and format-time options.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
-};
-
 use moat_common::{PAGE_SIZE, is_aligned};
 
 use crate::{
@@ -29,58 +21,10 @@ use crate::{
     layout::{BATCH_HEADER_LEN, SEGMENT_HEADER_LEN, footer_len, large_batch_len},
 };
 
-/// A source of wall-clock time in seconds, used for record expiry.
-pub trait Clock: Send + Sync + 'static {
-    /// Current Unix time in seconds.
-    fn now_secs(&self) -> u64;
-}
-
-/// The system clock.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now_secs(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    }
-}
-
-/// A clock that only moves when told to. Intended for tests.
-#[derive(Debug, Default)]
-pub struct ManualClock(AtomicU64);
-
-impl ManualClock {
-    /// Creates a clock at `now`.
-    pub fn new(now: u64) -> Self {
-        Self(AtomicU64::new(now))
-    }
-
-    /// Sets the current time.
-    pub fn set(&self, now: u64) {
-        self.0.store(now, Ordering::Relaxed);
-    }
-
-    /// Advances the current time by `secs`.
-    pub fn advance(&self, secs: u64) {
-        self.0.fetch_add(secs, Ordering::Relaxed);
-    }
-}
-
-impl Clock for ManualClock {
-    fn now_secs(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
-    }
-}
-
 /// Runtime options. None of these affect the on-disk format; a device may be
 /// opened with different options every time.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Options {
-    /// Clock used for expiry decisions.
-    pub clock: Arc<dyn Clock>,
     /// Values shorter than this are packed together with other small records
     /// into one batch; longer values get a large batch of their own and are
     /// written without copying. Default: 64 KiB.
@@ -105,7 +49,7 @@ pub struct Options {
     pub sync_on_flush: bool,
     /// Verify the record header and every checksum block touched by each `get`.
     /// Default: `false`; reads trust the index and do not scan the payload with
-    /// the CPU. Expiring records still read and validate their header for TTL.
+    /// the CPU.
     /// Writing checksums and recovery/reclaim validation are unaffected.
     pub verify_reads: bool,
 }
@@ -113,7 +57,6 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            clock: Arc::new(SystemClock),
             pack_threshold: 64 * 1024,
             batch_limit: 1024 * 1024,
             scan_window: 4 * 1024 * 1024,
@@ -122,20 +65,6 @@ impl Default for Options {
             sync_on_flush: false,
             verify_reads: false,
         }
-    }
-}
-
-impl std::fmt::Debug for Options {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Options")
-            .field("pack_threshold", &self.pack_threshold)
-            .field("batch_limit", &self.batch_limit)
-            .field("scan_window", &self.scan_window)
-            .field("index_capacity", &self.index_capacity)
-            .field("index_memory_budget", &self.index_memory_budget)
-            .field("sync_on_flush", &self.sync_on_flush)
-            .field("verify_reads", &self.verify_reads)
-            .finish_non_exhaustive()
     }
 }
 
