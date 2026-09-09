@@ -96,8 +96,8 @@ pub enum ReadOutcome {
 pub struct ReadCompletion {
     /// The token passed to [`Reader::get`].
     pub token: u64,
-    /// The bytes, `None` if the chunk had expired, or an error.
-    pub result: Result<Option<ChunkData>>,
+    /// The bytes, or an error.
+    pub result: Result<ChunkData>,
 }
 
 struct PendingRead {
@@ -145,9 +145,6 @@ impl Reader {
     }
 
     /// Returns metadata about a chunk without touching the disk.
-    ///
-    /// Expiry is not evaluated here; an expired chunk still reports its stat
-    /// until reclaim drops it.
     pub fn stat(&self, id: &ChunkId) -> Option<ChunkStat> {
         self.shared.index.get(&self.slot, id).map(|v| ChunkStat::from_value(&v))
     }
@@ -194,7 +191,7 @@ impl Reader {
             value.value_off as u64,
             value.value_len,
             covered,
-            verify || value.expires(),
+            verify,
         );
         let range = (value.value_off as u64 + range.start - geometry.extent.start) as usize
             ..(value.value_off as u64 + range.end - geometry.extent.start) as usize;
@@ -278,7 +275,7 @@ impl Reader {
     }
 
     /// Applies optional verification and returns the requested range.
-    fn finish(&self, pending: &PendingRead, done: IoCompletion) -> Result<Option<ChunkData>> {
+    fn finish(&self, pending: &PendingRead, done: IoCompletion) -> Result<ChunkData> {
         let id = &pending.id;
         let value = &pending.value;
         let geometry = &pending.geometry;
@@ -304,9 +301,6 @@ impl Reader {
             if header.kind != RecordKind::Data {
                 return Err(Error::corrupt(format!("chunk {id}: index points at a tombstone")));
             }
-            if self.shared.is_expired(header.expire_at) {
-                return Ok(None);
-            }
             if self.shared.options.verify_reads {
                 let covered = &buf[geometry.data_in_extent.clone()];
                 if let Err(block) = verify_blocks_with(covered, pending.first_block, |i| checksums.get(i)) {
@@ -314,10 +308,10 @@ impl Reader {
                 }
             }
         }
-        Ok(Some(ChunkData {
+        Ok(ChunkData {
             buf,
             range: pending.range.clone(),
-        }))
+        })
     }
 }
 

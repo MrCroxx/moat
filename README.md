@@ -70,8 +70,8 @@ reclaim and randomized model tests against an in-memory device.
 Server-side payload CRC verification is disabled by default
 (`Options::verify_reads = false`). Set it to `true` to verify the record header
 and every 64 KiB checksum block touched by each read. Unchecked reads cover
-only the requested pages; expiring records still read and validate their
-header. Checksum generation and recovery/reclaim validation are unchanged.
+only the requested pages. Checksum generation and recovery/reclaim validation
+are unchanged.
 Client-side transport and verification are not implemented yet.
 
 ## Benchmarking

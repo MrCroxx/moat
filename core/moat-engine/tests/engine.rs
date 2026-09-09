@@ -23,8 +23,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use moat_common::{ChunkId, HugePages, PoolOptions};
 use moat_engine::{
-    DeleteOutcome, Engine, Error, FormatOptions, IoQueue, ManualClock, MemDevice, Options, Outcome, PutOptions,
-    PutOutcome, QueueOptions, Reader, ReclaimPolicy, Writer, blocking,
+    DeleteOutcome, Engine, Error, FormatOptions, IoQueue, MemDevice, Options, Outcome, PutOptions, PutOutcome,
+    QueueOptions, Reader, ReclaimPolicy, Writer, blocking,
     io::{CompletionOrder, SyncQueue},
 };
 
@@ -334,10 +334,7 @@ fn out_of_order_completions_are_applied_in_order() {
     let mut q = SyncQueue::new(&queue_options(), CompletionOrder::Reverse).unwrap();
     let mut writer = engine.writer(&mut q).unwrap();
     let mut reader = engine.reader(&mut q).unwrap();
-    let overwrite = PutOptions {
-        overwrite: true,
-        ..Default::default()
-    };
+    let overwrite = PutOptions { overwrite: true };
     let mut expected = HashMap::new();
     let mut rng = XorShift(0x5151);
     // Many overwrites of a small key set with mixed sizes: large records are
@@ -534,10 +531,7 @@ fn overwrite_semantics() {
     );
     assert_eq!(read(&mut q, &mut reader, &id(1)).unwrap(), v0);
 
-    let overwrite = PutOptions {
-        overwrite: true,
-        ..Default::default()
-    };
+    let overwrite = PutOptions { overwrite: true };
     let PutOutcome::Written { lsn: lsn1, .. } = writer.put(&mut q, id(1), &v1, overwrite).unwrap() else {
         panic!()
     };
@@ -609,10 +603,7 @@ fn delete_interleaved_with_pending_puts() {
     assert!(matches!(writer.delete(&mut q, &id(4)).unwrap(), DeleteOutcome::Missing));
     // Large put (submitted at once) then a small pending put of the same key,
     // then a delete, then a new put: the last put must be what remains.
-    let overwrite = PutOptions {
-        overwrite: true,
-        ..Default::default()
-    };
+    let overwrite = PutOptions { overwrite: true };
     writer.put(&mut q, id(2), &value_for(2, 0, 70_000), overwrite).unwrap();
     writer.put(&mut q, id(2), b"small", overwrite).unwrap();
     assert!(matches!(
@@ -809,48 +800,36 @@ fn bit_rot_in_sealed_value_is_detected_and_reclaim_drops_it() {
 }
 
 #[test]
-fn header_validation_is_required_for_verification_or_expiry() {
+fn header_validation_is_required_only_for_verified_reads() {
     for verify_reads in [false, true] {
-        for expire_at in [0, u64::MAX] {
-            let device = new_device(4);
-            let engine = open_with(
-                &device,
-                Options {
-                    verify_reads,
-                    ..options()
-                },
-            );
-            let mut q = queue();
-            let mut writer = engine.writer(&mut q).unwrap();
-            let mut reader = engine.reader(&mut q).unwrap();
-            let value = value_for(1, 0, 100_000);
-            writer
-                .put(
-                    &mut q,
-                    id(1),
-                    &value,
-                    PutOptions {
-                        expire_at,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            flush(&mut q, &mut writer);
-            let stat = reader.stat(&id(1)).unwrap();
-            let segment = SEGMENT * (stat.segment as u64 + 1);
-            // The first large batch follows the segment header page.
-            let header = segment as usize + 4096 + moat_engine::layout::BATCH_HEADER_LEN;
-            device.with_data_mut(|data| data[header] ^= 1);
-            for range in [0..10, 70000..70010, 100_000..100_000] {
-                let result = blocking::get(&mut q, &mut reader, &id(1), Some(range.clone()));
-                if verify_reads || expire_at != 0 {
-                    assert!(matches!(result, Err(Error::Corrupt(_))));
-                } else {
-                    assert_eq!(
-                        &*result.unwrap().unwrap(),
-                        &value[range.start as usize..range.end as usize]
-                    );
-                }
+        let device = new_device(4);
+        let engine = open_with(
+            &device,
+            Options {
+                verify_reads,
+                ..options()
+            },
+        );
+        let mut q = queue();
+        let mut writer = engine.writer(&mut q).unwrap();
+        let mut reader = engine.reader(&mut q).unwrap();
+        let value = value_for(1, 0, 100_000);
+        writer.put(&mut q, id(1), &value, PutOptions::default()).unwrap();
+        flush(&mut q, &mut writer);
+        let stat = reader.stat(&id(1)).unwrap();
+        let segment = SEGMENT * (stat.segment as u64 + 1);
+        // The first large batch follows the segment header page.
+        let header = segment as usize + 4096 + moat_engine::layout::BATCH_HEADER_LEN;
+        device.with_data_mut(|data| data[header] ^= 1);
+        for range in [0..10, 70000..70010, 100_000..100_000] {
+            let result = blocking::get(&mut q, &mut reader, &id(1), Some(range.clone()));
+            if verify_reads {
+                assert!(matches!(result, Err(Error::Corrupt(_))));
+            } else {
+                assert_eq!(
+                    &*result.unwrap().unwrap(),
+                    &value[range.start as usize..range.end as usize]
+                );
             }
         }
     }
@@ -897,10 +876,7 @@ fn reclaim_storage_keeps_every_live_chunk() {
     let (engine, mut q, mut writer, mut reader) = setup(&device);
     let mut rng = XorShift(0xbeef);
     let mut model: HashMap<u128, Vec<u8>> = HashMap::new();
-    let overwrite = PutOptions {
-        overwrite: true,
-        ..Default::default()
-    };
+    let overwrite = PutOptions { overwrite: true };
 
     for round in 0..6u32 {
         for i in 0..150u128 {
@@ -957,10 +933,7 @@ fn reclaim_storage_keeps_every_live_chunk() {
 fn reclaim_runs_concurrently_with_foreground_writes() {
     let device = new_device(24);
     let (engine, mut q, mut writer, mut reader) = setup(&device);
-    let overwrite = PutOptions {
-        overwrite: true,
-        ..Default::default()
-    };
+    let overwrite = PutOptions { overwrite: true };
     let mut model: HashMap<u128, Vec<u8>> = HashMap::new();
     let mut rng = XorShift(0xc0ffee);
     for i in 0..200u128 {
@@ -1092,46 +1065,6 @@ fn reclaim_cache_evicts_oldest_and_reinserts_accessed() {
 }
 
 #[test]
-fn expiry_hides_and_reclaim_drops() {
-    let clock = Arc::new(ManualClock::new(1_000));
-    let device = new_device(6);
-    let engine = open_with(
-        &device,
-        Options {
-            clock: clock.clone(),
-            ..options()
-        },
-    );
-    let mut q = queue();
-    let mut writer = engine.writer(&mut q).unwrap();
-    let mut reader = engine.reader(&mut q).unwrap();
-    writer
-        .put(
-            &mut q,
-            id(1),
-            b"ephemeral",
-            PutOptions {
-                expire_at: 1_100,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    writer.put(&mut q, id(2), b"forever", PutOptions::default()).unwrap();
-    flush(&mut q, &mut writer);
-    assert!(read(&mut q, &mut reader, &id(1)).is_some());
-    clock.set(1_100);
-    assert!(read(&mut q, &mut reader, &id(1)).is_none());
-    assert!(read(&mut q, &mut reader, &id(2)).is_some());
-
-    seal(&mut q, &mut writer);
-    let report = reclaim(&mut q, &mut writer, ReclaimPolicy::Storage).unwrap();
-    assert_eq!(report.dropped, 1);
-    assert_eq!(report.relocated, 1);
-    assert!(!engine.contains(&id(1)));
-    assert!(read(&mut q, &mut reader, &id(2)).is_some());
-}
-
-#[test]
 fn no_space_is_reported_not_panicked() {
     let device = new_device(2);
     let (_engine, mut q, mut writer, _reader) = setup(&device);
@@ -1174,15 +1107,7 @@ fn index_budget_is_enforced() {
     assert_eq!(n, 56, "a 64-slot table takes 7/8 load");
     // Overwrites still work at the budget.
     assert!(matches!(
-        writer.put(
-            &mut q,
-            id(0),
-            b"w",
-            PutOptions {
-                overwrite: true,
-                ..Default::default()
-            }
-        ),
+        writer.put(&mut q, id(0), b"w", PutOptions { overwrite: true }),
         Ok(PutOutcome::Written { .. })
     ));
     // One delete is not enough: a rebuild at the same size needs the live
@@ -1261,16 +1186,7 @@ fn randomized_against_model() {
                 let version = versions.entry(k).or_insert(0);
                 *version += 1;
                 let v = value_for(k, *version, random_len(&mut rng));
-                let outcome = put(
-                    &mut q,
-                    &mut writer,
-                    id(k),
-                    &v,
-                    PutOptions {
-                        overwrite: true,
-                        ..Default::default()
-                    },
-                );
+                let outcome = put(&mut q, &mut writer, id(k), &v, PutOptions { overwrite: true });
                 assert!(matches!(outcome, PutOutcome::Written { .. }));
                 model.insert(k, (*version, v));
             }
@@ -1368,10 +1284,7 @@ fn concurrent_readers_never_see_torn_values() {
         })
         .collect();
 
-    let overwrite = PutOptions {
-        overwrite: true,
-        ..Default::default()
-    };
+    let overwrite = PutOptions { overwrite: true };
     for round in 1..40u32 {
         for k in 0..keys {
             put(&mut q, &mut writer, id(k), &value_for(k, round, len), overwrite);
@@ -1485,25 +1398,10 @@ fn framed_records_roundtrip_recover_and_reclaim() {
         put(&mut q, &mut writer, id(i), &v, PutOptions::default());
         expected.insert(i, v);
     }
-    // An expiring page-sized value must not be framed (its expiry lives in the
-    // header); it still reads back correctly.
-    let clockless = value_for(1000, 0, 4096);
-    writer
-        .put(
-            &mut q,
-            id(1000),
-            &clockless,
-            PutOptions {
-                expire_at: u64::MAX,
-                ..Default::default()
-            },
-        )
-        .unwrap();
     flush(&mut q, &mut writer);
     for (i, v) in &expected {
         assert_eq!(read(&mut q, &mut reader, &id(*i)).unwrap(), *v, "key {i}");
     }
-    assert_eq!(read(&mut q, &mut reader, &id(1000)).unwrap(), clockless);
     // Range reads inside a framed value.
     let got = blocking::get(&mut q, &mut reader, &id(0), Some(100..300))
         .unwrap()
@@ -1535,7 +1433,7 @@ fn framed_records_roundtrip_recover_and_reclaim() {
     let (engine, report) = moat_engine::open(device.clone(), options()).unwrap();
     let mut q = queue();
     let mut reader = engine.reader(&mut q).unwrap();
-    assert_eq!(report.chunks, expected.len() + 1);
+    assert_eq!(report.chunks, expected.len());
     for (i, v) in &expected {
         assert_eq!(
             read(&mut q, &mut reader, &id(*i)).unwrap(),
@@ -1685,7 +1583,7 @@ fn tiny_ring_depth_is_absorbed_by_ready_queues() {
         reader.poll(&mut q, &mut out).unwrap();
         for c in out.drain(..) {
             let i = tokens.remove(&c.token).unwrap();
-            assert_eq!(&*c.result.unwrap().unwrap(), &expected[&i][..]);
+            assert_eq!(&*c.result.unwrap(), &expected[&i][..]);
         }
     }
     assert_eq!(reader.in_flight(), 0);

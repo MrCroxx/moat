@@ -99,9 +99,9 @@ mod writer;
 pub use device::{Device, FileDevice, MemDevice};
 pub use engine::{ChunkStat, Engine, RecoveryReport, Usage, format, open};
 pub use error::{Error, Result};
-pub use index::{FLAG_ACCESSED, FLAG_EXPIRES, FLAG_FRAMED, FLAG_LARGE, IndexValue, Location, MAX_READERS};
+pub use index::{FLAG_ACCESSED, FLAG_FRAMED, FLAG_LARGE, IndexValue, Location, MAX_READERS};
 pub use io::{Descriptor, IoQueue, QueueOptions};
-pub use options::{Clock, FormatOptions, ManualClock, Options, SystemClock};
+pub use options::{FormatOptions, Options};
 pub use reader::{ChunkData, ReadCompletion, ReadOutcome, Reader};
 pub use writer::{
     Completion, DeleteOutcome, LargeValue, Lsn, Outcome, PutOptions, PutOutcome, ReclaimPolicy, ReclaimReport, Ticket,

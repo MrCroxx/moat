@@ -141,7 +141,7 @@ impl Handler for Load {
         for (disk, c) in cx.reads.drain(..) {
             let (d, i) = self.reads_pending.remove(&c.token).expect("known token");
             assert_eq!(d, disk);
-            let data = c.result.unwrap().expect("not expired");
+            let data = c.result.unwrap();
             assert_eq!(&*data, &value(disk, i)[..], "key {i} disk {disk}");
             self.reads_done += 1;
         }

@@ -82,8 +82,6 @@ pub const RECORD_FLAG_LARGE: u8 = 1;
 /// Record flag: the record is in a framed batch (header in the batch's header
 /// area, value page aligned).
 pub const RECORD_FLAG_FRAMED: u8 = 2;
-/// Record flag: the record has an expiry time.
-pub const RECORD_FLAG_EXPIRES: u8 = 4;
 
 // ---------------------------------------------------------------------------
 // Superblock
@@ -411,8 +409,6 @@ pub struct RecordHeader {
     pub lsn: u64,
     /// The chunk identifier.
     pub key: ChunkId,
-    /// Unix time (seconds) after which the record is expired; zero for never.
-    pub expire_at: u64,
 }
 
 impl RecordHeader {
@@ -451,8 +447,7 @@ impl RecordHeader {
             .u32(0)
             .u64(self.lsn)
             .bytes(self.key.as_bytes())
-            .u64(self.expire_at)
-            .skip(8);
+            .skip(16); // reserved
         debug_assert_eq!(w.position(), RECORD_HEADER_LEN);
         for c in checksums {
             w.u32(*c);
@@ -489,7 +484,6 @@ impl RecordHeader {
         r.skip(4);
         let lsn = r.u64();
         let key = ChunkId::from_bytes(r.array());
-        let expire_at = r.u64();
         Some((
             Self {
                 kind,
@@ -497,7 +491,6 @@ impl RecordHeader {
                 value_len,
                 lsn,
                 key,
-                expire_at,
             },
             BlockChecksums(&buf[RECORD_HEADER_LEN..meta_len]),
         ))
@@ -829,7 +822,6 @@ mod tests {
             value_len: 65536 * 2 + 1,
             lsn: 9,
             key: ChunkId::from_u128(123),
-            expire_at: 0,
         };
         let sums = [1u32, 2, 3];
         let mut buf = vec![0u8; hdr.meta_len()];
