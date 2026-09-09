@@ -481,9 +481,9 @@ to it.
   recovery and reclaim validation are unchanged, as are the on-disk record
   headers, checksum arrays and footer encoding. `ChunkData` returns data only;
   checksum transport and client-side verification are not implemented yet.
-- **CRC implementation** uses `crc-fast` throughout. The specialized 64 KiB
-  AVX-512 kernel has been removed. The engine and node benchmarks also disable
-  read verification by default; set `MOAT_BENCH_VERIFY=1` to enable it.
+- **CRC implementation** uses `crc-fast` throughout. The engine and node
+  benchmarks disable read verification by default; set `MOAT_BENCH_VERIFY=1`
+  to enable it.
 - **Pool free lists park blocks** on a per-order stack (up to 8 MiB per
   order) instead of merging on every release and splitting on every
   allocation, and never touch the block's own memory on the hot path (the

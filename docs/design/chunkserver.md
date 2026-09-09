@@ -1,7 +1,8 @@
 # A Chunkserver for Many Large NVMe Drives (design v0)
 
 > Status: design document. `moat-common` and `moat-engine` implement sections 3
-> and 4 on files and in-memory devices; everything else is planned.
+> and 4 on files and in-memory devices. `moat-server` implements disk discovery,
+> placement, recovery and workers; network transports and the client remain planned.
 >
 > The design distils operational experience with large RDMA-attached NVMe
 > storage fleets: rendezvous-style RDMA protocols, shared-CQ reactors, buffer
