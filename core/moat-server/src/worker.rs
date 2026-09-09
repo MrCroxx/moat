@@ -14,7 +14,7 @@
 
 //! Worker threads.
 //!
-//! A node runs one kind of worker. Every worker is pinned to a core and owns
+//! A node runs one kind of worker. Every worker may be pinned to a core and owns
 //! exactly one [`IoQueue`] (io_uring, one registered buffer pool, one
 //! fixed-file table) through which it drives every disk: it holds a
 //! [`Reader`] for each disk, so a read is served on the worker that receives
@@ -26,9 +26,9 @@
 //! [`Handler`]: the network reactor in a server, a load generator in a
 //! benchmark, a script in a test. It runs once per loop iteration on the
 //! worker thread, sees the completions the queue delivered since the last
-//! iteration, and issues new operations through the [`Context`]. Nothing here
-//! blocks except the queue's own wait, and only when the worker has nothing
-//! else to do.
+//! iteration, and issues new operations through the [`Context`]. With io_uring,
+//! only the queue's idle wait blocks. The synchronous development backend
+//! performs device I/O inline, so a slow disk can stall its worker.
 
 use std::{
     io,
@@ -41,10 +41,8 @@ use std::{
     time::Duration,
 };
 
-use moat_engine::{
-    Completion, Engine, IoQueue, QueueOptions, ReadCompletion, Reader, Writer, blocking,
-    io::{CompletionOrder, SyncQueue},
-};
+pub use moat_engine::QueueBackend;
+use moat_engine::{Completion, Engine, IoQueue, QueueOptions, ReadCompletion, Reader, Writer, blocking};
 
 /// Index of a disk in a node's disk list.
 pub type DiskId = usize;
@@ -60,15 +58,6 @@ pub enum PollMode {
         /// How long to sleep when neither I/O nor requests are pending.
         idle_sleep: Duration,
     },
-}
-
-/// Which [`IoQueue`] implementation a worker builds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueueBackend {
-    /// io_uring (Linux). Devices must expose a file descriptor.
-    Uring,
-    /// The blocking queue; works with any device, used by tests and tools.
-    Sync,
 }
 
 /// Configuration of one worker.
@@ -89,8 +78,14 @@ impl Default for WorkerOptions {
         Self {
             core: None,
             queue: QueueOptions::default(),
-            backend: QueueBackend::Uring,
-            poll_mode: PollMode::Busy,
+            backend: QueueBackend::Auto,
+            poll_mode: if cfg!(target_os = "linux") {
+                PollMode::Busy
+            } else {
+                PollMode::Adaptive {
+                    idle_sleep: Duration::from_millis(1),
+                }
+            },
         }
     }
 }
@@ -255,6 +250,7 @@ impl<H: Handler> Drop for Worker<H> {
 }
 
 /// Pins the calling thread to `core`.
+#[cfg(target_os = "linux")]
 pub fn pin_to_core(core: usize) -> io::Result<()> {
     // SAFETY: a zeroed cpu_set_t is a valid empty set; CPU_SET writes within
     // its bounds for any core below CPU_SETSIZE, which we check.
@@ -271,17 +267,13 @@ pub fn pin_to_core(core: usize) -> io::Result<()> {
     Ok(())
 }
 
-fn build_queue(opts: &WorkerOptions) -> io::Result<Box<dyn IoQueue>> {
-    match opts.backend {
-        QueueBackend::Sync => Ok(Box::new(SyncQueue::new(&opts.queue, CompletionOrder::Fifo)?)),
-        #[cfg(target_os = "linux")]
-        QueueBackend::Uring => Ok(Box::new(moat_engine::uring::UringQueue::new(&opts.queue)?)),
-        #[cfg(not(target_os = "linux"))]
-        QueueBackend::Uring => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "io_uring is only available on Linux",
-        )),
-    }
+/// CPU pinning is unsupported outside Linux; use `WorkerOptions::core = None`.
+#[cfg(not(target_os = "linux"))]
+pub fn pin_to_core(_core: usize) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "CPU pinning is only available on Linux",
+    ))
 }
 
 fn run_worker<H: Handler>(
@@ -299,7 +291,7 @@ fn run_worker<H: Handler>(
         if let Some(core) = opts.core {
             pin_to_core(core).map_err(io_err)?;
         }
-        let mut queue = build_queue(&opts).map_err(io_err)?;
+        let mut queue = opts.queue.build(opts.backend).map_err(io_err)?;
         let mut slots = Vec::with_capacity(disks.len());
         for (engine, owner) in disks {
             let reader = engine.reader(&mut *queue).map_err(engine_err)?;

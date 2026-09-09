@@ -22,14 +22,14 @@
 //! operation and handed back with the completion, so ownership is always
 //! unambiguous and no lifetime crosses the submission boundary.
 //!
-//! Enqueueing never blocks and never touches the device. When `depth`
+//! With io_uring, enqueueing never blocks and never touches the device. When `depth`
 //! operations are already in flight the operation is rejected *losslessly*: the
 //! buffer comes back to the caller, who keeps the operation in its own ready
 //! queue and retries after the next poll. [`IoQueue::vacant`] tells a caller
 //! exactly how many operations it can enqueue without a rejection.
 //!
 //! Two implementations exist: io_uring with registered fixed buffers and a
-//! fixed-file table ([`UringQueue`](crate::uring::UringQueue), Linux, the
+//! fixed-file table (`uring::UringQueue`, Linux, the
 //! production path) and [`SyncQueue`], which performs each operation
 //! immediately through the blocking [`Device`] interface and merely defers the
 //! completion. The sync queue keeps the engine portable and deterministic under
@@ -40,6 +40,30 @@ use std::{io, sync::Arc};
 use moat_common::{BufferPool, PoolOptions, PooledBuf};
 
 use crate::device::Device;
+
+/// Which I/O implementation to use. Selection happens when a queue is built.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum QueueBackend {
+    /// io_uring on Linux; synchronous I/O on other Unix platforms.
+    /// Linux initialization errors are returned, never silently downgraded.
+    #[default]
+    Auto,
+    /// Require io_uring. Returns `Unsupported` outside Linux.
+    Uring,
+    /// Blocking I/O for local development and tests; works with any device.
+    Sync,
+}
+
+impl QueueBackend {
+    /// Resolves `Auto` to the platform's backend, without allocating a queue.
+    pub const fn resolve(self) -> Self {
+        match self {
+            Self::Auto if cfg!(target_os = "linux") => Self::Uring,
+            Self::Auto => Self::Sync,
+            backend => backend,
+        }
+    }
+}
 
 /// Configuration of one [`IoQueue`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +82,27 @@ impl Default for QueueOptions {
             depth: 256,
             pool: PoolOptions::default(),
             descriptors: 256,
+        }
+    }
+}
+
+impl QueueOptions {
+    /// Builds a queue on the thread that will drive it.
+    ///
+    /// `Auto` chooses by platform, not by device: in-memory devices require
+    /// `Sync` on Linux. The synchronous backend blocks inside read/write/fsync
+    /// calls and only defers delivery of their completions until `poll`.
+    pub fn build(&self, backend: QueueBackend) -> io::Result<Box<dyn IoQueue>> {
+        match backend.resolve() {
+            QueueBackend::Sync => Ok(Box::new(SyncQueue::new(self, CompletionOrder::Fifo)?)),
+            #[cfg(target_os = "linux")]
+            QueueBackend::Uring => Ok(Box::new(crate::uring::UringQueue::new(self)?)),
+            #[cfg(not(target_os = "linux"))]
+            QueueBackend::Uring => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "io_uring is only available on Linux",
+            )),
+            QueueBackend::Auto => unreachable!("Auto has been resolved"),
         }
     }
 }
@@ -381,6 +426,36 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::device::MemDevice;
+
+    #[test]
+    fn platform_queue_selection() {
+        let expected = if cfg!(target_os = "linux") {
+            QueueBackend::Uring
+        } else {
+            QueueBackend::Sync
+        };
+        assert_eq!(QueueBackend::Auto.resolve(), expected);
+        assert_eq!(QueueBackend::Sync.resolve(), QueueBackend::Sync);
+        let mut queue = detach_options().build(QueueBackend::Sync).unwrap();
+        check_detach(
+            queue.as_mut(),
+            Arc::new(MemDevice::new(4096)),
+            Arc::new(MemDevice::new(4096)),
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn auto_uses_sync_and_explicit_uring_is_unsupported() {
+        let mut queue = detach_options().build(QueueBackend::Auto).unwrap();
+        check_detach(
+            queue.as_mut(),
+            Arc::new(MemDevice::new(4096)),
+            Arc::new(MemDevice::new(4096)),
+        );
+        let err = detach_options().build(QueueBackend::Uring).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
 
     pub(crate) fn check_detach(q: &mut dyn IoQueue, a: Arc<dyn Device>, b: Arc<dyn Device>) {
         let old = q.attach(&a).unwrap();

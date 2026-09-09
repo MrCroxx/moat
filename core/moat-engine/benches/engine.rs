@@ -46,9 +46,8 @@ use std::{
 
 use moat_common::{ChunkId, HugePages, PoolOptions, block_checksums};
 use moat_engine::{
-    Engine, Error, FileDevice, FormatOptions, IoQueue, Options, PutOptions, PutOutcome, QueueOptions, ReadOutcome,
-    Reader, Writer, blocking,
-    io::{CompletionOrder, SyncQueue},
+    Engine, Error, FileDevice, FormatOptions, IoQueue, Options, PutOptions, PutOutcome, QueueBackend, QueueOptions,
+    ReadOutcome, Reader, Writer, blocking,
 };
 
 const SEGMENT: u64 = 256 << 20;
@@ -72,18 +71,12 @@ fn queue_options() -> QueueOptions {
 
 /// Builds the queue for the calling thread.
 fn queue() -> Box<dyn IoQueue> {
-    let opts = queue_options();
-    if std::env::var_os("MOAT_BENCH_SYNC").is_some() {
-        return Box::new(SyncQueue::new(&opts, CompletionOrder::Fifo).unwrap());
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Box::new(moat_engine::uring::UringQueue::new(&opts).unwrap())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Box::new(SyncQueue::new(&opts, CompletionOrder::Fifo).unwrap())
-    }
+    let backend = if std::env::var_os("MOAT_BENCH_SYNC").is_some() {
+        QueueBackend::Sync
+    } else {
+        QueueBackend::Auto
+    };
+    queue_options().build(backend).unwrap()
 }
 
 fn gib_per_s(bytes: u64, elapsed: Duration) -> f64 {

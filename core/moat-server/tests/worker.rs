@@ -61,7 +61,12 @@ fn worker_options() -> WorkerOptions {
             },
             descriptors: 16,
         },
-        backend: QueueBackend::Sync,
+        // MemDevice needs Sync on Linux; exercise the default fallback elsewhere.
+        backend: if cfg!(target_os = "linux") {
+            QueueBackend::Sync
+        } else {
+            WorkerOptions::default().backend
+        },
         poll_mode: PollMode::Adaptive {
             idle_sleep: std::time::Duration::from_micros(50),
         },

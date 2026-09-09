@@ -33,30 +33,30 @@ The design document lives at [`docs/design/chunkserver.md`](docs/design/chunkser
 use std::sync::Arc;
 use moat_common::ChunkId;
 use moat_engine::{
-    FileDevice, FormatOptions, Options, PutOptions, QueueOptions, blocking, uring::UringQueue,
+    FileDevice, FormatOptions, Options, PutOptions, QueueBackend, QueueOptions, blocking,
 };
 
-let device = Arc::new(FileDevice::create("disk.img", 64 << 30, /* direct */ true)?);
+let device = Arc::new(FileDevice::create("disk.img", 64 << 30, /* direct */ false)?);
 moat_engine::format(&*device, &FormatOptions::default())?;
 
 let (engine, _) = moat_engine::open(device, Options::default())?;
-let mut queue = UringQueue::new(&QueueOptions::default())?;
-let mut writer = engine.writer(&mut queue)?;
-let mut reader = engine.reader(&mut queue)?;
+let mut queue = QueueOptions::default().build(QueueBackend::Auto)?;
+let mut writer = engine.writer(queue.as_mut())?;
+let mut reader = engine.reader(queue.as_mut())?;
 
 let id = ChunkId::from_u128(1);
-writer.put(&mut queue, id, b"hello", PutOptions::default())?;
-blocking::flush(&mut queue, &mut writer)?;
+writer.put(queue.as_mut(), id, b"hello", PutOptions::default())?;
+blocking::flush(queue.as_mut(), &mut writer)?;
 assert_eq!(
-    blocking::get(&mut queue, &mut reader, &id, None)?.as_deref(),
+    blocking::get(queue.as_mut(), &mut reader, &id, None)?.as_deref(),
     Some(&b"hello"[..]),
 );
-blocking::seal(&mut queue, &mut writer)?;
-writer.detach(&mut queue);
-reader.detach(&mut queue);
+blocking::seal(queue.as_mut(), &mut writer)?;
+writer.detach(queue.as_mut());
+reader.detach(queue.as_mut());
 ```
 
-Each worker owns an io_uring queue and a pool of registered buffers. Its readers
+On Linux, each worker owns an io_uring queue and registered buffers. Its readers
 and writers share that queue across disks; each disk has a single writer.
 Values move between buffers and the device without copies
 (`Writer::prepare_large` / `put_large` for writes,
@@ -73,6 +73,28 @@ and every 64 KiB checksum block touched by each read. Unchecked reads cover
 only the requested pages. Checksum generation and recovery/reclaim validation
 are unchanged.
 Client-side transport and verification are not implemented yet.
+
+## macOS 本地开发
+
+macOS 使用普通文件和同步 I/O 后端，用于功能开发与测试。可以直接运行：
+
+```sh
+cargo run -p moat-engine --example local
+cargo test --workspace
+```
+
+示例在临时文件中写入、读取并重新打开一个 4 KiB chunk，退出后自动清理。
+`QueueOptions::build(QueueBackend::Auto)` 在 Linux 选择 io_uring，在 macOS
+选择 `SyncQueue`；可用 `QueueBackend::resolve()` 查看选择结果。Linux 上的
+初始化错误会直接返回。显式指定 `Uring` 在 macOS 上返回 `Unsupported`；
+`MemDevice` 在 Linux 上需要显式指定 `Sync`。
+
+同步后端在调用线程执行阻塞 I/O，然后通过相同的 `poll`/completion 接口交付
+结果，不作为性能路径。Reader、Writer 和磁盘格式不随后端改变。
+macOS 使用 `FileDevice::create/open(..., false)`；显式请求 direct I/O、
+CPU 绑核或强制 huge pages 会返回 `Unsupported`。默认 huge-page 策略降级为
+普通映射，worker 默认使用 `Auto`、不绑核并在空闲时休眠。
+NVMe 自动发现仍仅支持 Linux；macOS 调用方显式提供文件设备。
 
 ## Benchmarking
 

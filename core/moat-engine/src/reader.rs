@@ -118,7 +118,8 @@ struct ReadyRead {
 }
 
 /// A disk's read pipeline on one queue: looks chunks up, submits reads through
-/// the caller's queue and hands back zero-copy views. Nothing blocks.
+/// the caller's queue and hands back zero-copy views. The io_uring backend
+/// never blocks; the synchronous development backend performs I/O inline.
 pub struct Reader {
     shared: Arc<Shared>,
     desc: Descriptor,
@@ -223,7 +224,7 @@ impl Reader {
     }
 
     /// Finishes reads, appends them to `out`, and pushes reads that
-    /// were waiting for queue room. Never waits. Returns the number appended.
+    /// were waiting for queue room. With io_uring, never waits. Returns the number appended.
     pub fn poll(&mut self, q: &mut dyn IoQueue, out: &mut Vec<ReadCompletion>) -> Result<usize> {
         // A worker visits every disk, but often has requests on only a few.
         // An idle reader cannot have completions in its private descriptor.

@@ -71,11 +71,13 @@ fn read_trimmed(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn read_num<T: std::str::FromStr>(path: &Path) -> Option<T> {
     read_trimmed(path)?.parse().ok()
 }
 
 /// Whether `name` is a whole NVMe namespace (`nvme<ctrl>n<ns>`, no partition).
+#[cfg(any(target_os = "linux", test))]
 fn is_namespace(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("nvme") else {
         return false;
@@ -91,10 +93,21 @@ fn is_namespace(name: &str) -> bool {
 }
 
 /// Lists every NVMe namespace on the machine, in name order.
+#[cfg(target_os = "linux")]
 pub fn discover() -> io::Result<Vec<NvmeDisk>> {
     discover_in(Path::new("/sys/class/block"), Path::new("/proc"))
 }
 
+/// NVMe discovery is Linux-only; open regular files explicitly on other platforms.
+#[cfg(not(target_os = "linux"))]
+pub fn discover() -> io::Result<Vec<NvmeDisk>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "NVMe discovery is only supported on Linux",
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn discover_in(block: &Path, proc: &Path) -> io::Result<Vec<NvmeDisk>> {
     let mounts = fs::read_to_string(proc.join("mounts")).unwrap_or_default();
     let swaps = fs::read_to_string(proc.join("swaps")).unwrap_or_default();
@@ -130,6 +143,7 @@ fn discover_in(block: &Path, proc: &Path) -> io::Result<Vec<NvmeDisk>> {
     Ok(disks)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn in_use(dir: &Path, name: &str, path: &Path, mounts: &str, swaps: &str) -> Option<InUse> {
     if let Ok(entries) = fs::read_dir(dir)
         && entries
@@ -163,6 +177,7 @@ fn in_use(dir: &Path, name: &str, path: &Path, mounts: &str, swaps: &str) -> Opt
 }
 
 /// Sort key that orders `nvme2n1` before `nvme10n1`.
+#[cfg(any(target_os = "linux", test))]
 fn natural_key(name: &str) -> Vec<u64> {
     name.split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty())
@@ -178,6 +193,7 @@ pub fn cpus_of_node(node: usize) -> Vec<usize> {
 }
 
 /// The CPUs this process may run on.
+#[cfg(target_os = "linux")]
 pub fn online_cpus() -> Vec<usize> {
     // SAFETY: a zeroed cpu_set_t is a valid set for sched_getaffinity to fill.
     unsafe {
@@ -189,6 +205,12 @@ pub fn online_cpus() -> Vec<usize> {
             .filter(|&c| libc::CPU_ISSET(c, &set))
             .collect()
     }
+}
+
+/// Logical worker indices based on available parallelism; not affinity IDs.
+#[cfg(not(target_os = "linux"))]
+pub fn online_cpus() -> Vec<usize> {
+    (0..std::thread::available_parallelism().map(usize::from).unwrap_or(1)).collect()
 }
 
 /// Parses a kernel CPU list such as `0-3,8,10-11`.

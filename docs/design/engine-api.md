@@ -140,6 +140,11 @@ Two implementations, as today:
 `Device` loses `open_queue` and gains `fn fd(&self) -> Option<BorrowedFd<'_>>`
 (`None` for `MemDevice`, which therefore only works with `SyncQueue`).
 
+队列创建可统一使用 `QueueOptions::build(QueueBackend::Auto)`：Linux 选择
+io_uring，macOS 选择用于本地开发的同步后端。`Auto` 仅按平台选择，不吞掉
+Linux 初始化错误；`Uring` 和 `Sync` 可显式指定。同步后端在提交操作时阻塞
+调用线程，保留相同的完成事件接口，不保证性能路径的非阻塞行为。
+
 Today's `read`/`write` take the buffer by value and return
 `io::ErrorKind::WouldBlock` when the ring is full — which drops the buffer the
 caller just filled. Handing it back makes rejection lossless; `vacant` lets a
