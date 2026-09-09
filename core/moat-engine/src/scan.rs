@@ -133,8 +133,8 @@ pub(crate) fn parse_batch<'a>(batch: &'a [u8], header: &BatchHeader, verify: boo
 pub(crate) enum BatchStep {
     /// A well-formed batch of `len` bytes starts here.
     Batch(BatchHeader, usize),
-    /// A well-formed batch header, but the batch extends past the window; the
-    /// caller must re-read from this position with a larger window.
+    /// The next header or batch extends past the window; the caller must
+    /// read another window starting at this position.
     NeedMore,
     /// Not a batch of this segment incarnation: the end of valid data.
     End,
@@ -146,8 +146,11 @@ pub(crate) enum BatchStep {
 /// scannable region of the segment; `max_batch` bounds the largest batch the
 /// engine could have written.
 pub(crate) fn next_batch(window: &[u8], rel: usize, seg_seq: u64, max_batch: u64, remaining: u64) -> BatchStep {
-    if remaining < BATCH_HEADER_LEN as u64 || rel + BATCH_HEADER_LEN > window.len() {
+    if remaining < BATCH_HEADER_LEN as u64 {
         return BatchStep::End;
+    }
+    if rel + BATCH_HEADER_LEN > window.len() {
+        return BatchStep::NeedMore;
     }
     let Some(header) = BatchHeader::decode(&window[rel..]) else {
         return BatchStep::End;
@@ -209,8 +212,8 @@ pub(crate) fn scan_batches_blocking(
                     rel += batch_len;
                 }
                 // The window always holds at least one maximal batch, so
-                // `NeedMore` here means the batch straddles the window end:
-                // continue from its start.
+                // `NeedMore` means the next batch straddles the window end
+                // or starts just beyond it: continue from its start.
                 BatchStep::NeedMore => break,
                 BatchStep::End => return Ok(cursor + rel as u64),
             }

@@ -30,8 +30,7 @@
 //!   pages its length allows.
 //! - A *framed* batch keeps all record headers in a header area at the front and every value page aligned after it. It
 //!   is used for values whose length is (just under) a multiple of the page size, where an inline header would push the
-//!   value across one more page: a 4 KiB value then costs exactly one page to read, verified against the CRC kept in
-//!   the index.
+//!   value across one more page: a 4 KiB value then costs exactly one page to read when verification is disabled.
 //!
 //! Every structure is self-describing: a magic value, then a CRC32C covering
 //! everything after it. Every batch carries the
@@ -39,6 +38,8 @@
 //! record carries its LSN. Together these make an unsealed segment recoverable
 //! by a forward scan and a reused segment immune to stale data from its
 //! previous life.
+
+use std::ops::Range;
 
 use moat_common::{ChunkId, PAGE_SIZE, align_down, align_up, block_count};
 
@@ -714,29 +715,34 @@ pub struct Extent {
     pub len: u64,
 }
 
-/// Describes what to read to access a record, given the offsets the index
-/// keeps for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Describes the pages covering a value range and an optional record header.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordGeometry {
     /// The aligned range that must be read.
     pub extent: Extent,
     /// Offset of the record header relative to `extent.start`, if the header
     /// is within the extent.
     pub header_in_extent: Option<u64>,
-    /// Offset of the value relative to `extent.start`.
-    pub value_in_extent: u64,
+    /// The requested value range relative to `extent.start`.
+    pub data_in_extent: Range<usize>,
 }
 
 impl RecordGeometry {
-    /// Computes the pages to read for a record whose header is at
-    /// `header_off` and whose value is at `value_off`. With `with_header` the
-    /// extent covers the header as well (for inline and large records this
-    /// adds nothing or one adjacent page; for framed records it may span back
-    /// to the batch's header area).
-    pub fn new(header_off: u64, value_off: u64, value_len: u32, with_header: bool) -> Self {
-        let value_end = value_off + value_len as u64;
-        let mut start = align_down(value_off, PAGE_SIZE);
-        let mut end = align_up(value_end.max(value_off + 1), PAGE_SIZE);
+    /// Computes the pages covering `range` within the value. The caller clamps
+    /// it to `value_len` and expands it to checksum blocks when verifying.
+    /// `with_header` also includes the complete record metadata.
+    pub fn new(header_off: u64, value_off: u64, value_len: u32, range: Range<u64>, with_header: bool) -> Self {
+        let data_start = value_off + range.start;
+        let data_end = value_off + range.end;
+        // Empty ranges use the preceding value byte when possible, so a range
+        // at the end of a page-aligned value does not read past the record.
+        let anchor = if range.is_empty() && range.start > 0 {
+            data_start - 1
+        } else {
+            data_start
+        };
+        let mut start = align_down(anchor, PAGE_SIZE);
+        let mut end = align_up(data_end.max(anchor + 1), PAGE_SIZE);
         if with_header {
             let meta = record_meta_len(value_len) as u64;
             start = start.min(align_down(header_off, PAGE_SIZE));
@@ -748,7 +754,7 @@ impl RecordGeometry {
                 len: end - start,
             },
             header_in_extent: with_header.then(|| header_off - start),
-            value_in_extent: value_off - start,
+            data_in_extent: (data_start - start) as usize..(data_end - start) as usize,
         }
     }
 
@@ -881,21 +887,21 @@ mod tests {
     #[test]
     fn geometry() {
         // Large record: header page then value, read together.
-        let g = RecordGeometry::new(4096 + BATCH_HEADER_LEN as u64, 8192, 100_000, true);
+        let g = RecordGeometry::new(4096 + BATCH_HEADER_LEN as u64, 8192, 100_000, 0..100_000, true);
         assert_eq!(g.extent.start, 4096);
         assert_eq!(g.header_in_extent, Some(BATCH_HEADER_LEN as u64));
-        assert_eq!(g.value_in_extent, 4096);
+        assert_eq!(g.data_in_extent, 4096..104_096);
         assert_eq!(g.extent.len, align_up(4096 + 100_000, PAGE_SIZE));
 
         // Inline record in the middle of a page.
         let meta = record_meta_len(500) as u64;
-        let g = RecordGeometry::new(8192 + 1000, 8192 + 1000 + meta, 500, true);
+        let g = RecordGeometry::new(8192 + 1000, 8192 + 1000 + meta, 500, 0..500, true);
         assert_eq!(g.extent, Extent { start: 8192, len: 4096 });
         assert_eq!(g.header_in_extent, Some(1000));
-        assert_eq!(g.value_in_extent, 1000 + meta);
+        assert_eq!(g.data_in_extent, (1000 + meta) as usize..(1500 + meta) as usize);
 
         // Framed record read without its header: exactly the value's pages.
-        let g = RecordGeometry::new(64, 3 * 4096, 4096, false);
+        let g = RecordGeometry::new(64, 3 * 4096, 4096, 0..4096, false);
         assert_eq!(
             g.extent,
             Extent {
@@ -904,9 +910,9 @@ mod tests {
             }
         );
         assert_eq!(g.header_in_extent, None);
-        assert_eq!(g.value_in_extent, 0);
+        assert_eq!(g.data_in_extent, 0..4096);
         // ...and with the header: back to the batch's header area.
-        let g = RecordGeometry::new(64, 3 * 4096, 4096, true);
+        let g = RecordGeometry::new(64, 3 * 4096, 4096, 0..4096, true);
         assert_eq!(
             g.extent,
             Extent {
@@ -917,8 +923,45 @@ mod tests {
         assert_eq!(g.header_in_extent, Some(64));
 
         // An empty value still reads its header page.
-        let g = RecordGeometry::new(100, 100 + 64, 0, true);
+        let g = RecordGeometry::new(100, 100 + 64, 0, 0..0, true);
         assert_eq!(g.extent, Extent { start: 0, len: 4096 });
+    }
+
+    #[test]
+    fn range_geometry_avoids_unrequested_pages() {
+        let g = RecordGeometry::new(4160, 8192, 131072, 70000..70010, false);
+        assert_eq!(
+            g.extent,
+            Extent {
+                start: 77824,
+                len: 4096
+            }
+        );
+        assert_eq!(g.data_in_extent, 368..378);
+        assert_eq!(g.header_in_extent, None);
+
+        // A verified first block includes the header but not the second block.
+        let g = RecordGeometry::new(4160, 8192, 131072, 0..65536, true);
+        assert_eq!(
+            g.extent,
+            Extent {
+                start: 4096,
+                len: 69632
+            }
+        );
+        assert_eq!(g.data_in_extent, 4096..69632);
+        assert_eq!(g.header_in_extent, Some(64));
+
+        // Empty ranges at EOF must not cross into the next page.
+        let g = RecordGeometry::new(4160, 8192, 131072, 131072..131072, false);
+        assert_eq!(
+            g.extent,
+            Extent {
+                start: 135168,
+                len: 4096
+            }
+        );
+        assert_eq!(g.data_in_extent, 4096..4096);
     }
 
     #[test]

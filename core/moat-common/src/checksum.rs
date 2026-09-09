@@ -16,16 +16,11 @@
 //!
 //! Chunk values are checksummed per [`CHECKSUM_BLOCK_SIZE`] block so that a
 //! range read only has to verify the blocks it touches. The same block
-//! checksums travel from the client over the wire to the disk and back, giving
-//! end-to-end integrity without recomputation at any hop.
+//! checksums can be carried by a transport to support end-to-end integrity
+//! without recomputation at every hop.
 //!
-//! The implementation is `crc-fast`, which folds the polynomial with
-//! carry-less multiplication (`VPCLMULQDQ` / `PCLMULQDQ` on x86, `PMULL` on
-//! AArch64) and selects the best kernel at runtime. On a modern server core it
-//! sustains tens of GiB/s independent of the input size, an order of magnitude
-//! faster than the single-stream `crc32` instruction, which matters because
-//! every 64 KiB block on a 100+ GB/s node is verified at least once.
-//! `cargo bench -p moat-common` measures it on the current machine.
+//! Uses `crc-fast` for both checksum generation and optional read verification.
+//! `cargo bench -p moat-common` measures throughput on the current machine.
 
 use crc_fast::{CrcAlgorithm, Digest};
 
@@ -155,5 +150,28 @@ mod tests {
         assert_eq!(verify_blocks(&corrupted, 0, &sums), Err(2));
         // Blocks before the corruption still verify on their own.
         assert!(verify_blocks(&corrupted[..CHECKSUM_BLOCK_SIZE * 2], 0, &sums).is_ok());
+    }
+
+    #[test]
+    fn preserves_partial_blocks_indices_and_first_error() {
+        let mut data = vec![0u8; CHECKSUM_BLOCK_SIZE * 4 + 17];
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+        let checksums = block_checksums(&data);
+        let first = 7;
+        let verify = |input: &[u8]| verify_blocks_with(input, first, |i| checksums.get((i - first) as usize).copied());
+        assert_eq!(verify(&data), Ok(()));
+        for block in 0..checksums.len() {
+            let at = block * CHECKSUM_BLOCK_SIZE;
+            data[at] ^= 1;
+            assert_eq!(verify(&data), Err(first + block as u32));
+            data[at] ^= 1;
+        }
+        data[CHECKSUM_BLOCK_SIZE] ^= 1;
+        data[CHECKSUM_BLOCK_SIZE * 3] ^= 1;
+        assert_eq!(verify(&data), Err(first + 1));
+        assert_eq!(verify_blocks_with(&[], first, |_| None), Ok(()));
+        assert_eq!(verify_blocks_with(&data, first, |_| None), Err(first));
     }
 }

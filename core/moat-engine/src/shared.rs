@@ -14,7 +14,10 @@
 
 //! State shared by the writer and all readers of one engine instance.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64},
+};
 
 use moat_common::{AlignedBuf, PAGE_SIZE};
 
@@ -31,9 +34,17 @@ pub(crate) struct Shared {
     pub(crate) device: Arc<dyn Device>,
     pub(crate) superblock: Superblock,
     pub(crate) geometry: Geometry,
-    pub(crate) index: Index,
+    pub(crate) index: Arc<Index>,
     pub(crate) segments: SegmentTable,
     pub(crate) options: Options,
+    /// Whether a `Writer` currently exists for this engine.
+    pub(crate) writer_taken: AtomicBool,
+    /// Written only by the writer (and recovery): the LSN the next record
+    /// receives and the sequence number the next segment allocation receives,
+    /// so a writer re-created after `detach` continues where the previous one
+    /// stopped.
+    pub(crate) next_lsn: AtomicU64,
+    pub(crate) next_seq: AtomicU64,
 }
 
 impl Shared {
@@ -45,7 +56,8 @@ impl Shared {
         Ok(buf)
     }
 
-    /// Writes `data` at `offset` within segment `seg_no`.
+    /// Writes `data` at `offset` within segment `seg_no` (blocking; recovery
+    /// only).
     pub(crate) fn write_segment_bytes(&self, seg_no: u32, offset: u64, data: &[u8]) -> Result<()> {
         debug_assert!(offset.is_multiple_of(PAGE_SIZE) && (data.len() as u64).is_multiple_of(PAGE_SIZE));
         self.device
@@ -59,12 +71,33 @@ impl Shared {
         SegmentHeader::decode(&buf)
     }
 
+    /// Writes a segment header (blocking; recovery only).
     pub(crate) fn write_segment_header(&self, header: &SegmentHeader) -> Result<()> {
         let mut buf = AlignedBuf::zeroed(SEGMENT_HEADER_LEN as usize);
         header.encode(&mut buf);
         self.device
             .write_at(&buf, self.geometry.segment_offset(header.seg_no))?;
         Ok(())
+    }
+
+    /// A segment header for `seg_no` in `state`.
+    pub(crate) fn segment_header(
+        &self,
+        seg_no: u32,
+        state: crate::layout::SegmentState,
+        kind: crate::layout::SegmentKind,
+        seq: u64,
+    ) -> SegmentHeader {
+        SegmentHeader {
+            disk_uuid: self.superblock.disk_uuid,
+            seg_no,
+            state,
+            kind,
+            seq,
+            footer_offset: 0,
+            footer_len: 0,
+            record_count: 0,
+        }
     }
 
     pub(crate) fn now(&self) -> u64 {

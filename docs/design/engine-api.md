@@ -1,10 +1,12 @@
 # moat-engine: a non-blocking API over a shared I/O queue
 
-> Status: proposal. Describes the target public API of `moat-engine` and the
+> Status: implemented (`core/moat-engine`), with the worker runtime in
+> `core/moat-server`. Describes the public API of `moat-engine` and the
 > ownership model behind it, matching the worker topology of `chunkserver.md`
 > §5.3 (one kind of worker, every worker reads every disk, one owner worker
 > per disk holds its writer). The on-disk format (§3, §4 of `chunkserver.md`)
-> is unchanged.
+> is unchanged. §11 lists where the implementation departs from the original
+> proposal.
 
 ## 1. Constraints
 
@@ -256,8 +258,11 @@ and `close`, and the `bool` return of `delete`.
 ### 5.1 Semantics
 
 - **Tickets** come from one counter per writer. Completions for puts and
-  deletes are delivered in ticket order; a barrier completes after every
-  ticket issued before it; reclaim completes whenever it finishes.
+  deletes are delivered in log order (the order their batches are applied,
+  which is LSN order within a batch but not necessarily ticket order across
+  a small pending batch and a large batch submitted at once); a barrier
+  completes after every ticket issued before it; reclaim completes whenever
+  it finishes.
 - **Visibility.** A put is visible to readers and durable when its
   completion reports `Ok`. A delete is invisible to *this writer* immediately
   (a subsequent `put` of the id is not `Exists`) and to readers when its
@@ -325,11 +330,10 @@ and drops `submit`, `poll(wait)` and `get_sync`. Every worker holds one
 `Reader` per disk, all on its own queue, so a GET is served on the worker that
 received it (`chunkserver.md` §5.3, §6.4).
 
-Why readers are many and writers one, in numbers: a single thread issuing
-4 KiB random reads through io_uring without `SQPOLL` tops out well below one
-PCIe 5 NVMe (measured: fio 1.24 M IOPS, the engine 745 k, the disk 2.9 M; four
-threads reach the disk with either). Reads therefore have to fan out over
-cores, while a single core's write bandwidth already matches a disk's.
+Readers can scale across workers independently of disk ownership. Small reads
+may exhaust a submission thread's CPU budget before reaching device capacity,
+so the reader count is configurable. Each disk retains one writer to serialize
+log allocation and index updates without cross-thread coordination.
 
 ## 7. Synchronization: the engine has no locks
 
@@ -345,10 +349,14 @@ lock-free structures:
 | Index | `Writer` writes, every `Reader` reads | Single-writer open-addressing table with per-slot sequence numbers (seqlock reads, `chunkserver.md` §4.4) |
 | Segment state, live bytes, pin counts | `Writer` writes, `Reader` pins/unpins | Atomics |
 
-The current implementation still has two mutexes — the index shards
-(`index.rs`) and the buddy allocator inside `BufferPool` (`pool.rs`). Both are
-removed as part of this change: the index becomes the seqlock table above and
-the pool becomes `!Sync`, with a `Send` claim type for buffers in transit.
+Neither the index nor the pool has a mutex. The index is the seqlock table
+above (`index.rs`: `Index` for readers, `IndexWriter` for the single writer,
+`ReaderSlot` epochs for table retirement). The pool (`moat-common/src/pool.rs`)
+belongs to the thread that created it: only that thread allocates or runs the
+buddy allocator, asserted at run time; a `PooledBuf` dropped on another thread
+pushes its block onto a lock-free return stack that the home thread drains on
+its next allocation. Buffers therefore stay plain `Send` values and need no
+separate claim type.
 
 ## 8. The worker loop
 
@@ -381,7 +389,9 @@ predicate:
 pub fn drive(q: &mut dyn IoQueue, w: &mut Writer, until: impl FnMut(&Completion) -> bool) -> Result<()>;
 ```
 
-which replaces every `flush()?` / `get_sync()` in the current tests.
+which is what the `blocking` module provides (`blocking::wait`, `flush`,
+`seal`, `reclaim`, `get`, `drain`), replacing every `flush()?` / `get_sync()`
+in the tests.
 
 ## 9. Change summary
 
@@ -418,3 +428,67 @@ disk, LSNs and segment allocation stay lock-free), the metadata calls (now on `E
 - Rebalancing engines between workers at run time.
 - The exact seqlock table layout and resize protocol; §7 fixes the contract
   (single writer, lock-free readers), not the data structure.
+
+## 11. Departures from the proposal
+
+Decided while implementing; each is a simplification with the reason next
+to it.
+
+- **Relocated records keep their LSN** (§4.5 of `chunkserver.md` updated).
+  Assigning a fresh LSN to a copy is only safe if no put of the same key is
+  pending or in flight, which is exactly the draining the non-blocking writer
+  can no longer do. With the LSN preserved, reclaim is a physical move and the
+  question does not arise. Before freeing a victim the job still waits until
+  every batch closed before its last decision is applied, so a tombstone or
+  newer version that justified dropping a record is durable first.
+- **Completion order** is log order, not ticket order (§5.1). Enforcing
+  ticket order would need a reorder buffer on the hot path for a property
+  nothing needs.
+- **Footer room** is reserved for records in batches that are enqueued but
+  not yet applied, not only for applied ones (`Active::fits`). Otherwise the
+  footer can grow beyond its reserved space and overwrite the next segment.
+- **Pending batches are placed when closed**, not bound to a segment when
+  their staging buffer is attached. Reserving worst-case footer room up front
+  (one entry per 64 bytes of staging) made small test segments fill with
+  reservations; placing at close time needs no reservation, and a batch that
+  cannot be placed (no free segment, no buffer for a segment header) simply
+  stays pending until the next `poll`.
+- **Readers do not drop corrupt index entries** (the index is single-writer).
+  A read that fails verification reports `Corrupt` every time; reclaim
+  verifies each record it visits and drops the ones whose value fails its
+  checksums (`ReclaimReport::corrupt`) instead of aborting the pass.
+- **`Options`** gained `index_capacity` (initial slots) and
+  `index_memory_budget` (`Error::IndexFull` beyond it) and lost
+  `index_shards`; `QueueOptions` gained `descriptors` (size of the fixed-file
+  table) and lost `force_sync` (the caller picks `UringQueue` or `SyncQueue`).
+  `attach` checks the pool for a maximal large batch and a staging batch
+  only; the reclaim window shrinks to the pool's largest class if it has to.
+- **`Descriptor` completions for a detached descriptor** are dropped by the
+  queue; `Writer::detach` and `Reader::detach` are the only way to release
+  a slot, and dropping a `Writer` without detaching leaks its slot until the
+  queue goes away (the engine's `writer_taken` flag is cleared either way).
+- **io_uring setup** uses `SINGLE_ISSUER` + `DEFER_TASKRUN` when the kernel
+  accepts them (completion work runs only inside our own `io_uring_enter`,
+  so a non-waiting `poll` enters with `GETEVENTS`), falling back to a plain
+  ring.
+- **`Options::verify_reads`** defaults to `false`: readers trust the index and
+  read only the pages covering the requested range without scanning the
+  payload on the CPU. Expiring records still read and validate their header.
+  When enabled, every read validates the header and every complete checksum
+  block touched by the range; empty ranges only validate the header. The
+  separate `verify_header_on_read` option, index CRC copy and headerless
+  single-block verification path have been removed. Checksum generation,
+  recovery and reclaim validation are unchanged, as are the on-disk record
+  headers, checksum arrays and footer encoding. `ChunkData` returns data only;
+  checksum transport and client-side verification are not implemented yet.
+- **CRC implementation** uses `crc-fast` throughout. The specialized 64 KiB
+  AVX-512 kernel has been removed. The engine and node benchmarks also disable
+  read verification by default; set `MOAT_BENCH_VERIFY=1` to enable it.
+- **Pool free lists park blocks** on a per-order stack (up to 8 MiB per
+  order) instead of merging on every release and splitting on every
+  allocation, and never touch the block's own memory on the hot path (the
+  intrusive links live in blocks the device has just written, so touching
+  them was a cache miss per operation). Parked blocks merge when an
+  allocation finds nothing large enough.
+- **`UringQueue` stages SQEs** and copies them into the submission ring once
+  per submit rather than opening the ring's view per entry.

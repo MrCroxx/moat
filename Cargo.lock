@@ -235,7 +235,6 @@ version = "0.0.0"
 dependencies = [
  "crc-fast",
  "libc",
- "parking_lot",
  "uuid",
 ]
 
@@ -247,6 +246,17 @@ dependencies = [
  "libc",
  "moat-common",
  "parking_lot",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "moat-server"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "moat-common",
+ "moat-engine",
  "tempfile",
  "thiserror",
 ]

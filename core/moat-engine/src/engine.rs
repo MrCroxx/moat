@@ -12,26 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Formatting and opening (recovery).
+//! Formatting, opening (recovery) and the per-disk [`Engine`] handle.
 
-use std::{collections::VecDeque, ops::ControlFlow, sync::Arc};
+use std::{
+    ops::ControlFlow,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
 
-use moat_common::{AlignedBuf, PAGE_SIZE};
+use moat_common::{AlignedBuf, ChunkId, PAGE_SIZE};
 
 use crate::{
     device::Device,
     error::{Error, Result},
-    index::{FLAG_DEAD, Index, IndexValue, Location, flags_from_record},
+    index::{FLAG_DEAD, Index, IndexValue, IndexWriter, Location, flags_from_record},
+    io::IoQueue,
     layout::{
         Extent, FooterEntry, RecordGeometry, RecordKind, SEGMENT_HEADER_LEN, SUPERBLOCK_A_OFFSET, SUPERBLOCK_B_OFFSET,
-        SUPERBLOCK_LEN, SegmentHeader, SegmentKind, SegmentState, Superblock, decode_footer, large_batch_len,
+        SUPERBLOCK_LEN, SegmentHeader, SegmentKind, SegmentState, Superblock, decode_footer, encode_footer, footer_len,
+        large_batch_len,
     },
     options::{Clock, FormatOptions, Options, SystemClock},
     reader::Reader,
     scan::{parse_batch, scan_batches_blocking},
     segments::{Geometry, SegmentTable},
     shared::Shared,
-    writer::{Writer, seal_segment},
+    writer::{Lsn, Writer},
 };
 
 /// Formats `device`, destroying any previous contents.
@@ -101,24 +109,201 @@ pub struct RecoveryReport {
     pub next_lsn: u64,
 }
 
-/// An opened engine.
-pub struct Opened {
-    /// The single writer.
-    pub writer: Writer,
-    /// A reader handle; clone it freely.
-    pub reader: Reader,
-    /// What recovery did.
-    pub report: RecoveryReport,
+/// Metadata about a stored chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkStat {
+    /// Value length in bytes.
+    pub len: u32,
+    /// LSN of the newest record.
+    pub lsn: Lsn,
+    /// Physical segment holding the record.
+    pub segment: u32,
+    /// Offset of the value within the segment.
+    pub value_offset: u32,
+    /// Whether the record is stored framed (header apart from the page
+    /// aligned value).
+    pub framed: bool,
+}
+
+impl ChunkStat {
+    pub(crate) fn from_value(v: &IndexValue) -> Self {
+        Self {
+            len: v.value_len,
+            lsn: v.lsn,
+            segment: v.loc.seg_no,
+            value_offset: v.value_off,
+            framed: v.is_framed(),
+        }
+    }
+}
+
+/// Space usage of an engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    /// Total number of segments.
+    pub segments: u32,
+    /// Segments not in use.
+    pub free_segments: u32,
+    /// Segments closed and eligible for reclaim.
+    pub sealed_segments: u32,
+    /// Bytes of records the index points at, across all segments.
+    pub live_bytes: u64,
+    /// Number of chunks in the index.
+    pub chunks: usize,
+    /// Bytes the index table occupies.
+    pub index_bytes: usize,
+}
+
+/// One disk: the state every pipeline of the disk shares (index, segment
+/// table, superblock, options). Cheap to clone, `Send + Sync`, and does no
+/// I/O itself; create a [`Writer`] or [`Reader`] on a queue to move data.
+#[derive(Clone)]
+pub struct Engine {
+    shared: Arc<Shared>,
+}
+
+impl Engine {
+    /// Returns metadata about a chunk without touching the disk.
+    ///
+    /// Expiry is not evaluated here; an expired chunk still reports its stat
+    /// until reclaim drops it. Management path: a thread that reads regularly
+    /// should use [`Reader::stat`] instead.
+    pub fn stat(&self, id: &ChunkId) -> Option<ChunkStat> {
+        self.shared
+            .index
+            .get_unregistered(id)
+            .map(|v| ChunkStat::from_value(&v))
+    }
+
+    /// Whether a chunk exists in the index.
+    pub fn contains(&self, id: &ChunkId) -> bool {
+        self.stat(id).is_some()
+    }
+
+    /// Current space usage.
+    pub fn usage(&self) -> Usage {
+        let segments = &self.shared.segments;
+        let mut usage = Usage {
+            segments: segments.len(),
+            free_segments: 0,
+            sealed_segments: 0,
+            live_bytes: 0,
+            chunks: self.shared.index.len(),
+            index_bytes: self.shared.index.table_bytes(),
+        };
+        for s in segments.iter() {
+            match segments.state(s) {
+                SegmentState::Free => usage.free_segments += 1,
+                SegmentState::Sealed => usage.sealed_segments += 1,
+                SegmentState::Active => {}
+            }
+            usage.live_bytes += segments.live_bytes(s);
+        }
+        usage
+    }
+
+    /// The segment size this device was formatted with.
+    pub fn segment_size(&self) -> u64 {
+        self.shared.superblock.segment_size
+    }
+
+    /// The largest value this device accepts.
+    pub fn chunk_max(&self) -> u32 {
+        self.shared.superblock.chunk_max
+    }
+
+    /// The device's identity as recorded in the superblock.
+    pub fn disk_uuid(&self) -> [u8; 16] {
+        self.shared.superblock.disk_uuid
+    }
+
+    /// The device capacity in bytes.
+    pub fn capacity(&self) -> u64 {
+        self.shared.device.capacity()
+    }
+
+    /// The disk's single write pipeline, attached to `q`.
+    ///
+    /// Fails with [`Error::InvalidOption`] if `q`'s pool cannot hold the
+    /// largest buffer the writer will request, and with [`Error::Busy`] if a
+    /// writer already exists (call [`Writer::detach`] first).
+    pub fn writer(&self, q: &mut dyn IoQueue) -> Result<Writer> {
+        self.check_pool(q)?;
+        if self.shared.writer_taken.swap(true, Ordering::AcqRel) {
+            return Err(Error::Busy);
+        }
+        let desc = match q.attach(&self.shared.device) {
+            Ok(desc) => desc,
+            Err(e) => {
+                self.shared.writer_taken.store(false, Ordering::Release);
+                return Err(Error::Io(e));
+            }
+        };
+        Ok(Writer::new(self.shared.clone(), desc))
+    }
+
+    /// A read pipeline for the calling thread, attached to `q`. Any number may
+    /// exist.
+    pub fn reader(&self, q: &mut dyn IoQueue) -> Result<Reader> {
+        self.check_pool(q)?;
+        let slot = self
+            .shared
+            .index
+            .register()
+            .ok_or_else(|| Error::InvalidOption("too many readers registered on this engine".into()))?;
+        let desc = match q.attach(&self.shared.device) {
+            Ok(desc) => desc,
+            Err(e) => {
+                self.shared.index.unregister(slot);
+                return Err(Error::Io(e));
+            }
+        };
+        Ok(Reader::new(self.shared.clone(), desc, slot))
+    }
+
+    /// The pool must hold a maximal batch and a staging batch.
+    fn check_pool(&self, q: &dyn IoQueue) -> Result<()> {
+        let needed = self.shared.largest_buffer();
+        if q.pool().max_class() < needed {
+            return Err(Error::InvalidOption(format!(
+                "queue pool max class {} is below the {needed} bytes this engine needs",
+                q.pool().max_class()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("disk_uuid", &self.shared.superblock.disk_uuid)
+            .field("segments", &self.shared.geometry.segment_count)
+            .field("chunks", &self.shared.index.len())
+            .finish()
+    }
+}
+
+impl Shared {
+    /// Largest pool buffer any pipeline of this engine needs: a maximal large
+    /// batch or a staging batch (the reclaim window shrinks to the pool if it
+    /// has to).
+    pub(crate) fn largest_buffer(&self) -> usize {
+        let largest = large_batch_len(self.superblock.chunk_max) as usize;
+        largest.max(self.options.batch_limit).next_power_of_two()
+    }
 }
 
 /// Opens a formatted device, rebuilding the in-memory index.
 ///
-/// Sealed segments are indexed from their footers; segments left active by a
-/// crash are scanned forward, verified record by record, and sealed. Every key
-/// resolves to its highest-LSN record, and keys whose newest record is a
-/// tombstone are dropped. The cost is proportional to the number of records
-/// on the device, not its capacity.
-pub fn open(device: Arc<dyn Device>, mut options: Options) -> Result<Opened> {
+/// Blocking, and touches no queue: it runs before the engine is attached to
+/// any worker, once per process start, and disks recover in parallel by
+/// calling it on several threads. Sealed segments are indexed from their
+/// footers; segments left active by a crash are scanned forward, verified
+/// record by record, and sealed. Every key resolves to its highest-LSN record,
+/// and keys whose newest record is a tombstone are dropped. The cost is
+/// proportional to the number of records on the device, not its capacity.
+pub fn open(device: Arc<dyn Device>, mut options: Options) -> Result<(Engine, RecoveryReport)> {
     options.validate()?;
     let superblock = read_superblock(&*device)?;
     // A pending batch must always fit in a fresh segment together with the
@@ -131,18 +316,6 @@ pub fn open(device: Arc<dyn Device>, mut options: Options) -> Result<Opened> {
         .next_power_of_two()
         .max(2 * PAGE_SIZE as usize);
     options.pack_threshold = options.pack_threshold.min((options.batch_limit / 2) as u32);
-    // The writer's pool must be able to hold a maximal batch, a staging batch
-    // and a scan window.
-    let largest = large_batch_len(superblock.chunk_max) as usize;
-    let needed = largest
-        .max(options.batch_limit)
-        .max(options.scan_window)
-        .next_power_of_two();
-    options.queue.pool.max_class = options.queue.pool.max_class.max(needed);
-    let minimum_pool_bytes = needed
-        .checked_mul(options.writer_pool_capacity_multiplier)
-        .ok_or_else(|| Error::InvalidOption("writer pool capacity exceeds addressable memory".into()))?;
-    options.queue.pool.bytes = options.queue.pool.bytes.max(minimum_pool_bytes);
     let geometry = Geometry::for_device(device.capacity(), superblock.segment_size);
     if geometry.segment_count < superblock.segment_count {
         return Err(Error::Unformatted(format!(
@@ -157,18 +330,21 @@ pub fn open(device: Arc<dyn Device>, mut options: Options) -> Result<Opened> {
 
     let shared = Arc::new(Shared {
         device,
-        index: Index::new(options.index_shards),
+        index: Arc::new(Index::new(options.index_capacity, options.index_memory_budget)),
         segments: SegmentTable::new(geometry.segment_count),
         geometry,
         superblock,
         options,
+        writer_taken: AtomicBool::new(false),
+        next_lsn: AtomicU64::new(1),
+        next_seq: AtomicU64::new(1),
     });
+    let mut index = IndexWriter::new(shared.index.clone());
 
     let mut report = RecoveryReport {
         segments: geometry.segment_count,
         ..Default::default()
     };
-    let mut free = Vec::new();
     let mut actives: Vec<(SegmentHeader, u64, Vec<FooterEntry>)> = Vec::new();
     let mut max_seq = 0u64;
     let mut max_lsn = 0u64;
@@ -178,13 +354,11 @@ pub fn open(device: Arc<dyn Device>, mut options: Options) -> Result<Opened> {
             Ok(h) if h.disk_uuid == shared.superblock.disk_uuid && h.seg_no == seg_no => h,
             _ => {
                 report.unreadable_headers += 1;
-                free.push(seg_no);
                 continue;
             }
         };
         max_seq = max_seq.max(header.seq);
         if header.state == SegmentState::Free {
-            free.push(seg_no);
             continue;
         }
         shared.segments.set(seg_no, header.state, header.kind, header.seq);
@@ -213,10 +387,11 @@ pub fn open(device: Arc<dyn Device>, mut options: Options) -> Result<Opened> {
         match footer_entries {
             Some(entries) => {
                 report.sealed += 1;
+                shared.segments.set_sealed(seg_no, header.footer_offset);
                 for entry in entries {
                     report.records += 1;
                     max_lsn = max_lsn.max(entry.lsn);
-                    merge_entry(&shared.index, seg_no, &entry);
+                    merge_entry(&mut index, seg_no, &entry)?;
                 }
             }
             None => {
@@ -225,19 +400,24 @@ pub fn open(device: Arc<dyn Device>, mut options: Options) -> Result<Opened> {
                 for entry in &entries {
                     report.records += 1;
                     max_lsn = max_lsn.max(entry.lsn);
-                    merge_entry(&shared.index, seg_no, entry);
+                    merge_entry(&mut index, seg_no, entry)?;
                 }
                 actives.push((header, tail, entries));
             }
         }
     }
 
-    // Keys whose newest record is a tombstone are gone.
-    shared.index.retain(|_, v| v.flags & FLAG_DEAD == 0);
+    // Keys whose newest record is a tombstone are gone; the rebuild drops the
+    // tombstone slots they leave behind.
+    index.retain(|_, v| v.flags & FLAG_DEAD == 0);
+    if index.tombstones() > 0 {
+        let capacity = shared.index.capacity();
+        index.rebuild(capacity);
+    }
 
     // Live bytes follow from the final index, not from the order records
     // were merged in.
-    shared.index.for_each(|_, v| {
+    index.for_each(|_, v| {
         shared
             .segments
             .add_live(v.loc.seg_no, RecordGeometry::footprint(v.value_len, v.record_flags()));
@@ -246,16 +426,15 @@ pub fn open(device: Arc<dyn Device>, mut options: Options) -> Result<Opened> {
     // Seal whatever was active so the tail is described by a footer and the
     // writer starts on fresh segments.
     for (header, tail, entries) in actives {
-        seal_segment(&shared, header.seg_no, header.seq, header.kind, tail, &entries)?;
+        seal_segment_blocking(&shared, header.seg_no, header.seq, header.kind, tail, &entries)?;
     }
 
     report.chunks = shared.index.len();
     report.next_lsn = max_lsn + 1;
-    free.sort_unstable();
-    let queue = shared.device.open_queue(&shared.options.queue)?;
-    let writer = Writer::new(shared.clone(), queue, VecDeque::from(free), max_seq + 1, max_lsn + 1);
-    let reader = Reader::new(shared);
-    Ok(Opened { writer, reader, report })
+    drop(index);
+    shared.next_lsn.store(max_lsn + 1, Ordering::Release);
+    shared.next_seq.store(max_seq + 1, Ordering::Release);
+    Ok((Engine { shared }, report))
 }
 
 /// Scans a segment forward, verifying every record, and returns the offset at
@@ -296,12 +475,12 @@ fn scan_segment(shared: &Shared, seg_no: u32, seq: u64) -> Result<(u64, Vec<Foot
 
 /// Merges one recovered record into the index: highest LSN wins, tombstones
 /// are kept as dead markers until every record has been seen.
-fn merge_entry(index: &Index, seg_no: u32, entry: &FooterEntry) {
+fn merge_entry(index: &mut IndexWriter, seg_no: u32, entry: &FooterEntry) -> Result<()> {
     let mut flags = flags_from_record(entry.flags);
     if entry.kind == RecordKind::Tombstone {
         flags |= FLAG_DEAD;
     }
-    index.insert_if_newer(
+    let outcome = index.insert_if_newer(
         entry.key,
         IndexValue {
             loc: Location {
@@ -311,10 +490,37 @@ fn merge_entry(index: &Index, seg_no: u32, entry: &FooterEntry) {
             value_off: entry.value_off,
             value_len: entry.value_len,
             flags,
-            crc: entry.crc,
             lsn: entry.lsn,
         },
     );
+    if outcome == crate::index::InsertOutcome::Full {
+        return Err(Error::IndexFull);
+    }
+    Ok(())
+}
+
+/// Writes a footer at `tail` and marks the segment sealed (blocking; recovery
+/// only — the writer seals asynchronously through its queue).
+pub(crate) fn seal_segment_blocking(
+    shared: &Shared,
+    seg_no: u32,
+    seq: u64,
+    kind: SegmentKind,
+    tail: u64,
+    footer: &[FooterEntry],
+) -> Result<()> {
+    let len = footer_len(footer.len());
+    let mut buf = AlignedBuf::zeroed(len as usize);
+    encode_footer(seq, footer, &mut buf);
+    shared.write_segment_bytes(seg_no, tail, &buf)?;
+    shared.write_segment_header(&SegmentHeader {
+        footer_offset: tail,
+        footer_len: len,
+        record_count: footer.len() as u64,
+        ..shared.segment_header(seg_no, SegmentState::Sealed, kind, seq)
+    })?;
+    shared.segments.set_sealed(seg_no, tail);
+    Ok(())
 }
 
 fn read_superblock(device: &dyn Device) -> Result<Superblock> {

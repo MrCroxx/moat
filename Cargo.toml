@@ -38,6 +38,7 @@ libc = "0.2"
 # Moat crates
 moat-common = { path = "core/moat-common" }
 moat-engine = { path = "core/moat-engine" }
+moat-server = { path = "core/moat-server" }
 parking_lot = "0.12"
 tempfile = "3"
 thiserror = "2"

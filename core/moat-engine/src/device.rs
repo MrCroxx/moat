@@ -14,11 +14,14 @@
 
 //! The block device abstraction the engine runs on.
 //!
-//! A [`Device`] offers two things: blocking, page-aligned positional I/O for
-//! metadata (superblocks, segment headers, footers, recovery scans), and
-//! [`IoQueue`]s for the data path, one per thread. Keeping the interface this
-//! small lets the same engine run on a raw NVMe namespace, a file
-//! (development), or an in-memory buffer (tests with fault injection).
+//! A [`Device`] offers blocking, page-aligned positional I/O (used by
+//! formatting and recovery, which run before any queue exists) and, where it
+//! has one, a file descriptor for the asynchronous data path: an
+//! [`IoQueue`](crate::io::IoQueue) attaches the device through
+//! [`Device::fd`]. Keeping the interface this small lets the same engine run on
+//! a raw NVMe namespace, a file (development), or an in-memory buffer (tests
+//! with fault injection; served by the blocking
+//! [`SyncQueue`](crate::io::SyncQueue)).
 //!
 //! All offsets and lengths passed to a [`Device`] are multiples of
 //! [`PAGE_SIZE`]; implementations may rely on it. Buffers passed to a device
@@ -30,18 +33,16 @@ use std::{
     fs::{File, OpenOptions},
     io,
     ops::Range,
-    os::unix::fs::FileExt,
-    path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+    os::{
+        fd::{AsFd, BorrowedFd},
+        unix::fs::FileExt,
     },
+    path::Path,
+    sync::Arc,
 };
 
 use moat_common::{PAGE_SIZE, is_aligned};
 use parking_lot::{Mutex, RwLock};
-
-use crate::io::{BlockingIo, CompletionOrder, IoQueue, QueueOptions, SyncQueue};
 
 /// A block device.
 pub trait Device: Send + Sync + 'static {
@@ -60,8 +61,10 @@ pub trait Device: Send + Sync + 'static {
     /// Flushes the device's volatile write cache.
     fn sync(&self) -> io::Result<()>;
 
-    /// Opens an asynchronous queue for the calling thread.
-    fn open_queue(&self, opts: &QueueOptions) -> io::Result<Box<dyn IoQueue>>;
+    /// The file descriptor an asynchronous queue registers, if the device has
+    /// one. Devices without a descriptor can only be driven through the
+    /// blocking [`SyncQueue`](crate::io::SyncQueue).
+    fn fd(&self) -> Option<BorrowedFd<'_>>;
 }
 
 fn check_io(buf_len: usize, offset: u64, capacity: u64) -> io::Result<()> {
@@ -136,20 +139,6 @@ fn device_len(file: &File) -> io::Result<u64> {
     f.seek(SeekFrom::End(0))
 }
 
-impl BlockingIo for File {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        FileExt::read_exact_at(self, buf, offset)
-    }
-
-    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        FileExt::write_all_at(self, buf, offset)
-    }
-
-    fn sync(&self) -> io::Result<()> {
-        self.sync_data()
-    }
-}
-
 impl Device for FileDevice {
     fn capacity(&self) -> u64 {
         self.len
@@ -169,13 +158,8 @@ impl Device for FileDevice {
         self.file.sync_data()
     }
 
-    fn open_queue(&self, opts: &QueueOptions) -> io::Result<Box<dyn IoQueue>> {
-        let file = self.file.try_clone()?;
-        #[cfg(target_os = "linux")]
-        if !opts.force_sync {
-            return Ok(Box::new(crate::uring::UringQueue::new(file, opts)?));
-        }
-        Ok(Box::new(SyncQueue::new(file, opts, CompletionOrder::Fifo)?))
+    fn fd(&self) -> Option<BorrowedFd<'_>> {
+        Some(self.file.as_fd())
     }
 }
 
@@ -187,15 +171,15 @@ struct MemState {
     data: RwLock<Vec<u8>>,
     /// Writes overlapping this range fail with `EIO`.
     fail_writes: Mutex<Option<Range<u64>>>,
-    reverse_completions: AtomicBool,
 }
 
 /// An in-memory device for tests.
 ///
 /// Besides the [`Device`] interface it exposes the raw bytes so tests can
 /// simulate torn writes, bit rot and truncated tails between an engine
-/// shutdown and the next open, plus knobs to fail writes in a byte range and
-/// to deliver queue completions out of order.
+/// shutdown and the next open, plus a knob to fail writes in a byte range.
+/// It has no file descriptor, so it is driven through a
+/// [`SyncQueue`](crate::io::SyncQueue).
 pub struct MemDevice {
     state: Arc<MemState>,
 }
@@ -208,7 +192,6 @@ impl MemDevice {
             state: Arc::new(MemState {
                 data: RwLock::new(vec![0; len as usize]),
                 fail_writes: Mutex::new(None),
-                reverse_completions: AtomicBool::new(false),
             }),
         }
     }
@@ -226,11 +209,6 @@ impl MemDevice {
     /// Makes every write that overlaps `range` fail with `EIO` (`None` clears).
     pub fn fail_writes_in(&self, range: Option<Range<u64>>) {
         *self.state.fail_writes.lock() = range;
-    }
-
-    /// Makes queues opened afterwards report completions in reverse order.
-    pub fn set_reverse_completions(&self, reverse: bool) {
-        self.state.reverse_completions.store(reverse, Ordering::Relaxed);
     }
 }
 
@@ -258,20 +236,6 @@ impl MemState {
     }
 }
 
-impl BlockingIo for Arc<MemState> {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        MemState::read_at(self, buf, offset)
-    }
-
-    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        MemState::write_at(self, buf, offset)
-    }
-
-    fn sync(&self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 impl Device for MemDevice {
     fn capacity(&self) -> u64 {
         self.state.data.read().len() as u64
@@ -289,13 +253,8 @@ impl Device for MemDevice {
         Ok(())
     }
 
-    fn open_queue(&self, opts: &QueueOptions) -> io::Result<Box<dyn IoQueue>> {
-        let order = if self.state.reverse_completions.load(Ordering::Relaxed) {
-            CompletionOrder::Reverse
-        } else {
-            CompletionOrder::Fifo
-        };
-        Ok(Box::new(SyncQueue::new(self.state.clone(), opts, order)?))
+    fn fd(&self) -> Option<BorrowedFd<'_>> {
+        None
     }
 }
 
