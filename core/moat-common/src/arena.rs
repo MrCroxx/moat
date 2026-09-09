@@ -24,6 +24,8 @@
 //! allocation falls back from explicit huge pages (`MAP_HUGETLB`) to
 //! transparent huge pages (`madvise(MADV_HUGEPAGE)`) to plain pages, so the
 //! engine runs everywhere and merely gets faster where huge pages exist.
+//! These huge-page optimizations are Linux-only. Other Unix platforms use
+//! plain mappings unless explicit huge pages are required, which is unsupported.
 
 use std::{io, ptr::NonNull};
 
@@ -77,49 +79,60 @@ impl Arena {
     /// Maps `len` bytes (rounded up to the page size the backing uses).
     pub fn new(len: usize, huge: HugePages) -> io::Result<Self> {
         assert!(len > 0, "arena must not be empty");
-        let mut last_err = None;
-        if huge != HugePages::Disabled {
-            for (page, flag) in [
-                (HUGE_PAGE_1G, libc::MAP_HUGETLB | libc::MAP_HUGE_1GB),
-                (HUGE_PAGE_2M, libc::MAP_HUGETLB | libc::MAP_HUGE_2MB),
-            ] {
-                let rounded = align_up(len as u64, page) as usize;
-                // Do not burn a 1 GiB page on a small arena.
-                if rounded > 2 * len && page == HUGE_PAGE_1G {
-                    continue;
-                }
-                match Self::map(rounded, flag) {
-                    Ok(ptr) => {
-                        let backing = if page == HUGE_PAGE_1G {
-                            Backing::Huge1G
-                        } else {
-                            Backing::Huge2M
-                        };
-                        return Ok(Self {
-                            ptr,
-                            len: rounded,
-                            backing,
-                        });
+        #[cfg(target_os = "linux")]
+        {
+            let mut last_err = None;
+            if huge != HugePages::Disabled {
+                for (page, flag) in [
+                    (HUGE_PAGE_1G, libc::MAP_HUGETLB | libc::MAP_HUGE_1GB),
+                    (HUGE_PAGE_2M, libc::MAP_HUGETLB | libc::MAP_HUGE_2MB),
+                ] {
+                    let rounded = align_up(len as u64, page) as usize;
+                    // Do not burn a 1 GiB page on a small arena.
+                    if rounded > 2 * len && page == HUGE_PAGE_1G {
+                        continue;
                     }
-                    Err(e) => last_err = Some(e),
+                    match Self::map(rounded, flag) {
+                        Ok(ptr) => {
+                            let backing = if page == HUGE_PAGE_1G {
+                                Backing::Huge1G
+                            } else {
+                                Backing::Huge2M
+                            };
+                            return Ok(Self {
+                                ptr,
+                                len: rounded,
+                                backing,
+                            });
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                if huge == HugePages::Required {
+                    return Err(last_err.unwrap_or_else(|| io::Error::other("huge pages unavailable")));
                 }
             }
-            if huge == HugePages::Required {
-                return Err(last_err.unwrap_or_else(|| io::Error::other("huge pages unavailable")));
-            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        if huge == HugePages::Required {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "explicit huge pages are only supported on Linux",
+            ));
         }
 
         let rounded = align_up(len as u64, PAGE_SIZE) as usize;
         let ptr = Self::map(rounded, 0)?;
-        let mut backing = Backing::Plain;
-        if huge != HugePages::Disabled {
+        let backing = Backing::Plain;
+        #[cfg(target_os = "linux")]
+        let backing = if huge != HugePages::Disabled {
             // SAFETY: `ptr..ptr+rounded` is a mapping we own; MADV_HUGEPAGE is
             // advisory and cannot invalidate it.
             let rc = unsafe { libc::madvise(ptr.as_ptr().cast(), rounded, libc::MADV_HUGEPAGE) };
-            if rc == 0 {
-                backing = Backing::Transparent;
-            }
-        }
+            if rc == 0 { Backing::Transparent } else { backing }
+        } else {
+            backing
+        };
         Ok(Self {
             ptr,
             len: rounded,
@@ -208,5 +221,14 @@ mod tests {
         let arena = Arena::new(8 << 20, HugePages::Preferred).unwrap();
         assert!(arena.len() >= 8 << 20);
         assert_eq!(arena.as_ptr() as usize % PAGE_SIZE as usize, 0);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(arena.backing(), Backing::Plain);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn required_huge_pages_are_unsupported() {
+        let err = Arena::new(4096, HugePages::Required).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 }

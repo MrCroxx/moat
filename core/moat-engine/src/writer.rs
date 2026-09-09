@@ -20,14 +20,15 @@
 //! thread, the engine needs no locking at all: the index is a single-writer
 //! structure, and everything else the writer touches is owned by it.
 //!
-//! # No call blocks
+//! # Non-blocking with io_uring
 //!
 //! Every method either does memory work and returns, enqueues I/O on the
 //! caller's [`IoQueue`] and returns a [`Ticket`], or reports
 //! [`Error::Busy`] (the pool is out of buffers; poll and retry). Completion is
 //! observed only through [`Writer::poll`], which also advances the state
 //! machines behind sealing, barriers and reclaim. A slow disk therefore never
-//! stalls the other disks that share its worker.
+//! stalls the other disks that share its worker when using io_uring. The
+//! synchronous development backend performs blocking I/O on this thread.
 //!
 //! # I/O pipeline
 //!
@@ -982,7 +983,7 @@ impl Writer {
     /// Applies completions that arrived for this writer, advances the sealing,
     /// barrier and reclaim state machines, submits whatever became ready
     /// (including any partially filled pending batch), and appends the
-    /// resulting [`Completion`]s to `out`. Never waits. Returns the number
+    /// resulting [`Completion`]s to `out`. With io_uring, never waits. Returns the number
     /// appended.
     pub fn poll(&mut self, q: &mut dyn IoQueue, out: &mut Vec<Completion>) -> Result<usize> {
         self.scratch.clear();

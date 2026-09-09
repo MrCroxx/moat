@@ -52,7 +52,7 @@
 
 - POSIX file semantics; partial overwrite inside a chunk (emulate with read-modify-write of a new version at the client).
 - Server-side range listing or prefix scans.
-- 对象 TTL 和生命周期由上层管理；chunkserver 通过显式删除和 GC 回收数据，不按时间使 chunk 过期。
+- Object TTL and lifecycle management belong to the upper layer. The chunkserver reclaims data through explicit deletion and GC; chunks do not expire based on time.
 - Multi-tenancy isolation and encryption (flag bits are reserved in the protocol; not in v0).
 
 ---

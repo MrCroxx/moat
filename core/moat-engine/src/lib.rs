@@ -39,11 +39,14 @@
 //! engines through it. An [`Engine`] is a disk's shared state; a [`Writer`] or
 //! a [`Reader`] is a pipeline of that disk attached to one queue. Exactly one
 //! writer exists per disk (all mutations, sealing and reclaim go through it);
-//! any number of readers may exist, one per worker in practice. No engine call
+//! any number of readers may exist, one per worker in practice. With io_uring, no pipeline call
 //! blocks: every method does memory work, enqueues I/O and returns a ticket,
 //! or reports [`Error::Busy`] when the pool is out of buffers. Completions are
 //! observed only through `poll`. Values move between pool buffers and the
 //! device without copies.
+//! On macOS, [`QueueOptions::build`] selects a synchronous development backend
+//! for [`QueueBackend::Auto`]. It uses the same pipelines and completion API,
+//! but performs blocking device I/O on the caller's thread.
 //!
 //! # Example
 //!
@@ -100,7 +103,7 @@ pub use device::{Device, FileDevice, MemDevice};
 pub use engine::{ChunkStat, Engine, RecoveryReport, Usage, format, open};
 pub use error::{Error, Result};
 pub use index::{FLAG_ACCESSED, FLAG_FRAMED, FLAG_LARGE, IndexValue, Location, MAX_READERS};
-pub use io::{Descriptor, IoQueue, QueueOptions};
+pub use io::{Descriptor, IoQueue, QueueBackend, QueueOptions};
 pub use options::{FormatOptions, Options};
 pub use reader::{ChunkData, ReadCompletion, ReadOutcome, Reader};
 pub use writer::{

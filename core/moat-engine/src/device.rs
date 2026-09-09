@@ -97,6 +97,8 @@ impl FileDevice {
     ///
     /// With `direct` set the file is opened with `O_DIRECT`, bypassing the page
     /// cache. This requires every buffer to be page aligned in memory.
+    /// Outside Linux, `direct = true` returns `Unsupported`; use buffered
+    /// regular files (`direct = false`) for local development.
     pub fn open(path: impl AsRef<Path>, direct: bool) -> io::Result<Self> {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true);
@@ -106,7 +108,12 @@ impl FileDevice {
             opts.custom_flags(libc::O_DIRECT);
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = direct;
+        if direct {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "direct I/O is only supported on Linux",
+            ));
+        }
         let file = opts.open(path)?;
         let len = device_len(&file)?;
         Ok(Self { file, len })
@@ -114,6 +121,14 @@ impl FileDevice {
 
     /// Creates (or truncates) a regular file of `len` bytes and opens it.
     pub fn create(path: impl AsRef<Path>, len: u64, direct: bool) -> io::Result<Self> {
+        // Reject unsupported options before creating or truncating the file.
+        #[cfg(not(target_os = "linux"))]
+        if direct {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "direct I/O is only supported on Linux",
+            ));
+        }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -244,6 +259,19 @@ impl Device for MemDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn unsupported_direct_io_does_not_truncate_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.img");
+        std::fs::write(&path, b"preserve me").unwrap();
+        let err = FileDevice::create(&path, 4096, true).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve me");
+        let err = FileDevice::open(&path, true).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
 
     #[test]
     fn mem_device_rejects_unaligned() {

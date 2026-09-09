@@ -1305,10 +1305,15 @@ fn concurrent_readers_never_see_torn_values() {
 /// The same engine on a real file, with `O_DIRECT` and io_uring where the
 /// platform supports them (tmpfs does not support `O_DIRECT`; the test then
 /// falls back to buffered I/O).
-#[cfg(target_os = "linux")]
 #[test]
-fn file_device_roundtrip_with_direct_io_and_uring() {
-    use moat_engine::{FileDevice, uring::UringQueue};
+fn file_device_roundtrip_with_platform_and_sync_queues() {
+    for backend in [moat_engine::QueueBackend::Auto, moat_engine::QueueBackend::Sync] {
+        file_device_roundtrip(backend);
+    }
+}
+
+fn file_device_roundtrip(backend: moat_engine::QueueBackend) {
+    use moat_engine::FileDevice;
 
     /// Keep the registered pool below the locked-memory limit of standard
     /// hosted CI runners. The 128 KiB class still accommodates the test
@@ -1351,36 +1356,36 @@ fn file_device_roundtrip_with_direct_io_and_uring() {
     let mut expected = HashMap::new();
     {
         let (engine, _) = moat_engine::open(device.clone(), file_options.clone()).unwrap();
-        let mut q = UringQueue::new(&file_queue_options()).unwrap();
-        let mut writer = engine.writer(&mut q).unwrap();
-        let mut reader = engine.reader(&mut q).unwrap();
+        let mut q = file_queue_options().build(backend).unwrap();
+        let mut writer = engine.writer(q.as_mut()).unwrap();
+        let mut reader = engine.reader(q.as_mut()).unwrap();
         for i in 0..64u128 {
             let len = random_len(&mut rng).min(FILE_CHUNK_MAX as usize);
             let v = value_for(i, 0, len);
-            put(&mut q, &mut writer, id(i), &v, PutOptions::default());
+            put(q.as_mut(), &mut writer, id(i), &v, PutOptions::default());
             expected.insert(i, v);
         }
-        flush(&mut q, &mut writer);
+        flush(q.as_mut(), &mut writer);
         for (i, v) in &expected {
-            assert_eq!(read(&mut q, &mut reader, &id(*i)).unwrap(), *v);
+            assert_eq!(read(q.as_mut(), &mut reader, &id(*i)).unwrap(), *v);
         }
-        // Reclaim through the ring as well.
-        seal(&mut q, &mut writer);
-        reclaim(&mut q, &mut writer, ReclaimPolicy::Storage).unwrap();
+        // Reclaim through the selected queue as well.
+        seal(q.as_mut(), &mut writer);
+        reclaim(q.as_mut(), &mut writer, ReclaimPolicy::Storage).unwrap();
         for (i, v) in &expected {
-            assert_eq!(read(&mut q, &mut reader, &id(*i)).unwrap(), *v);
+            assert_eq!(read(q.as_mut(), &mut reader, &id(*i)).unwrap(), *v);
         }
-        close(&mut q, writer);
-        reader.detach(&mut q);
+        close(q.as_mut(), writer);
+        reader.detach(q.as_mut());
     }
     let reopened = Arc::new(FileDevice::open(&path, false).unwrap());
     let (engine, report) = moat_engine::open(reopened, file_options).unwrap();
-    let mut q = UringQueue::new(&file_queue_options()).unwrap();
-    let mut reader = engine.reader(&mut q).unwrap();
+    let mut q = file_queue_options().build(backend).unwrap();
+    let mut reader = engine.reader(q.as_mut()).unwrap();
     assert_eq!(report.chunks, 64);
     assert_eq!(report.scanned, 0);
     for (i, v) in &expected {
-        assert_eq!(read(&mut q, &mut reader, &id(*i)).unwrap(), *v);
+        assert_eq!(read(q.as_mut(), &mut reader, &id(*i)).unwrap(), *v);
     }
 }
 

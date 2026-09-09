@@ -33,30 +33,30 @@ The design document lives at [`docs/design/chunkserver.md`](docs/design/chunkser
 use std::sync::Arc;
 use moat_common::ChunkId;
 use moat_engine::{
-    FileDevice, FormatOptions, Options, PutOptions, QueueOptions, blocking, uring::UringQueue,
+    FileDevice, FormatOptions, Options, PutOptions, QueueBackend, QueueOptions, blocking,
 };
 
-let device = Arc::new(FileDevice::create("disk.img", 64 << 30, /* direct */ true)?);
+let device = Arc::new(FileDevice::create("disk.img", 64 << 30, /* direct */ false)?);
 moat_engine::format(&*device, &FormatOptions::default())?;
 
 let (engine, _) = moat_engine::open(device, Options::default())?;
-let mut queue = UringQueue::new(&QueueOptions::default())?;
-let mut writer = engine.writer(&mut queue)?;
-let mut reader = engine.reader(&mut queue)?;
+let mut queue = QueueOptions::default().build(QueueBackend::Auto)?;
+let mut writer = engine.writer(queue.as_mut())?;
+let mut reader = engine.reader(queue.as_mut())?;
 
 let id = ChunkId::from_u128(1);
-writer.put(&mut queue, id, b"hello", PutOptions::default())?;
-blocking::flush(&mut queue, &mut writer)?;
+writer.put(queue.as_mut(), id, b"hello", PutOptions::default())?;
+blocking::flush(queue.as_mut(), &mut writer)?;
 assert_eq!(
-    blocking::get(&mut queue, &mut reader, &id, None)?.as_deref(),
+    blocking::get(queue.as_mut(), &mut reader, &id, None)?.as_deref(),
     Some(&b"hello"[..]),
 );
-blocking::seal(&mut queue, &mut writer)?;
-writer.detach(&mut queue);
-reader.detach(&mut queue);
+blocking::seal(queue.as_mut(), &mut writer)?;
+writer.detach(queue.as_mut());
+reader.detach(queue.as_mut());
 ```
 
-Each worker owns an io_uring queue and a pool of registered buffers. Its readers
+On Linux, each worker owns an io_uring queue and registered buffers. Its readers
 and writers share that queue across disks; each disk has a single writer.
 Values move between buffers and the device without copies
 (`Writer::prepare_large` / `put_large` for writes,
@@ -73,6 +73,34 @@ and every 64 KiB checksum block touched by each read. Unchecked reads cover
 only the requested pages. Checksum generation and recovery/reclaim validation
 are unchanged.
 Client-side transport and verification are not implemented yet.
+
+## Local development on macOS
+
+macOS uses regular files and synchronous I/O for functional development and
+testing. To try it:
+
+```sh
+cargo run -p moat-engine --example local
+cargo test --workspace
+```
+
+The example writes and reads a 4 KiB chunk, reopens the temporary file to
+verify recovery, and removes the file on exit.
+`QueueOptions::build(QueueBackend::Auto)` selects io_uring on Linux and
+`SyncQueue` on macOS; `QueueBackend::resolve()` reports the selection.
+Initialization errors on Linux are returned directly. Explicitly selecting
+`Uring` on macOS returns `Unsupported`; `MemDevice` on Linux requires an
+explicit `Sync` selection.
+
+The synchronous backend performs blocking I/O on the caller's thread and
+delivers results through the same `poll`/completion interface. It is intended
+for development, not the performance path. Reader, Writer, and the disk format
+are shared by both backends.
+On macOS, use `FileDevice::create/open(..., false)`. Explicit requests for
+direct I/O, CPU pinning, or required huge pages return `Unsupported`.
+The default huge-page policy falls back to plain mappings. Workers default to
+`Auto`, without CPU pinning, and sleep when idle.
+NVMe discovery remains Linux-only; macOS callers supply file devices explicitly.
 
 ## Benchmarking
 

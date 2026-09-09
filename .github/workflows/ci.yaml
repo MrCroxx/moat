@@ -27,8 +27,12 @@ env:
 
 jobs:
   check:
-    name: fmt, clippy, test
-    runs-on: ubuntu-latest
+    name: fmt, clippy, test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,6 +56,8 @@ jobs:
         run: cargo clippy --workspace --all-targets
       - name: Test
         run: cargo test --workspace
+      - name: Local example
+        run: cargo run -p moat-engine --example local
       - name: Docs
         run: cargo doc --workspace --no-deps
         env:
