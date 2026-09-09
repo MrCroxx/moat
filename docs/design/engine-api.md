@@ -230,7 +230,7 @@ impl Writer {
     pub fn seal(&mut self, q: &mut dyn IoQueue) -> Result<Ticket>;
     /// Starts one reclaim pass. `None` if there is no sealed segment.
     /// `Busy` while a previous pass is still running.
-    pub fn reclaim(&mut self, q: &mut dyn IoQueue, policy: ReclaimPolicy) -> Result<Option<Ticket>>;
+    pub fn reclaim(&mut self, q: &mut dyn IoQueue) -> Result<Option<Ticket>>;
 
     // -- progress -----------------------------------------------------------
 
@@ -243,7 +243,7 @@ impl Writer {
     pub fn in_flight(&self) -> usize;
     pub fn free_segments(&self) -> u32;
     pub fn next_lsn(&self) -> Lsn;
-    pub fn pick_victim(&self, policy: ReclaimPolicy) -> Option<u32>;
+    pub fn pick_victim(&self) -> Option<u32>;
 
     /// Closes the descriptor. Call after `seal` has completed and `in_flight()`
     /// is zero; otherwise in-flight batches are abandoned (recovery handles
@@ -461,9 +461,9 @@ to it.
   cannot be placed (no free segment, no buffer for a segment header) simply
   stays pending until the next `poll`.
 - **Readers do not drop corrupt index entries** (the index is single-writer).
-  A read that fails verification reports `Corrupt` every time; reclaim
-  verifies each record it visits and drops the ones whose value fails its
-  checksums (`ReclaimReport::corrupt`) instead of aborting the pass.
+  A read that fails verification reports `Corrupt` every time. Reclaim
+  aborts with `Corrupt` on an invalid live value or a malformed batch before
+  the sealed data boundary, retaining the victim for repair or explicit deletion.
 - **`Options`** gained `index_capacity` (initial slots) and
   `index_memory_budget` (`Error::IndexFull` beyond it) and lost
   `index_shards`; `QueueOptions` gained `descriptors` (size of the fixed-file

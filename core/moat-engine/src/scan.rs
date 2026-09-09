@@ -16,8 +16,9 @@
 //!
 //! Recovery (for unsealed segments) and reclaim (for every victim) both walk a
 //! segment batch by batch. The scan stops at the first byte range that is not a
-//! well-formed batch of the segment's current incarnation, which is exactly the
-//! end of the log for an active segment and the footer for a sealed one.
+//! well-formed batch of the segment's current incarnation. Active-segment
+//! recovery treats this as the end of the recoverable prefix; reclaim requires
+//! the scan to reach the sealed segment's known data boundary.
 
 use std::ops::ControlFlow;
 

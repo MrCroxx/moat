@@ -48,9 +48,6 @@ use crate::segments::SegmentTable;
 
 /// Index flag: the record lives in a large batch.
 pub const FLAG_LARGE: u32 = 1;
-/// Index flag: the record has been read since it was written or last
-/// relocated. Used by cache-mode reclaim to decide what to keep.
-pub const FLAG_ACCESSED: u32 = 2;
 /// Index flag (recovery only): the newest record for this key is a tombstone.
 pub(crate) const FLAG_DEAD: u32 = 4;
 /// Index flag: the record lives in a framed batch (header separate from the
@@ -106,12 +103,6 @@ impl IndexValue {
     #[inline]
     pub fn is_framed(&self) -> bool {
         self.flags & FLAG_FRAMED != 0
-    }
-
-    /// Whether the record has been read since written or relocated.
-    #[inline]
-    pub fn is_accessed(&self) -> bool {
-        self.flags & FLAG_ACCESSED != 0
     }
 
     /// The on-disk record flags this entry was derived from, for footprint
@@ -471,7 +462,7 @@ impl Index {
 
     /// Looks a chunk up and pins the segment it lives in before returning,
     /// re-validating the entry after the pin so that a segment reclaim removed
-    /// the entry from is never returned. Marks the entry as accessed.
+    /// the entry from is never returned.
     ///
     /// The caller must unpin the segment once it has finished reading.
     pub fn get_and_pin(&self, slot: &ReaderSlot, id: &ChunkId, segments: &SegmentTable) -> Option<IndexValue> {
@@ -499,9 +490,6 @@ impl Index {
         if std::ptr::eq(table, self.current.load(Ordering::Acquire))
             && table.slots[i].seq.load(Ordering::Relaxed) == seq
         {
-            if value.flags & FLAG_ACCESSED == 0 {
-                table.slots[i].flags.fetch_or(FLAG_ACCESSED, Ordering::Relaxed);
-            }
             return true;
         }
         segments.unpin(value.loc.seg_no);
@@ -653,18 +641,6 @@ impl IndexWriter {
         }
     }
 
-    /// Removes the entry if it still points at `expected`.
-    pub fn remove_if_at(&mut self, id: &ChunkId, expected: Location) -> Option<IndexValue> {
-        let table = self.index.table();
-        match table.locate(id) {
-            Located::Occupied(i, existing) if existing.loc == expected => {
-                self.bury(table, i);
-                Some(existing)
-            }
-            _ => None,
-        }
-    }
-
     fn bury(&self, table: &Table, i: usize) {
         table.slots[i].bury();
         self.index.live.fetch_sub(1, Ordering::Relaxed);
@@ -672,9 +648,6 @@ impl IndexWriter {
     }
 
     /// Replaces the entry with `value` if it still points at `expected`.
-    ///
-    /// The accessed flag of the existing entry is *not* carried over: a
-    /// relocated record starts a fresh access history.
     pub fn replace_if_at(&mut self, id: &ChunkId, expected: Location, value: IndexValue) -> bool {
         let table = self.index.table();
         match table.locate(id) {
@@ -901,14 +874,13 @@ mod tests {
         assert!(!w.replace_if_at(&id, wrong, value(5, 0, 2)));
         assert!(w.replace_if_at(&id, right, value(5, 0, 2)));
         assert_eq!(w.get(&id).unwrap().loc.seg_no, 5);
-        assert!(w.remove_if_at(&id, right).is_none());
-        assert!(w.remove_if_at(&id, Location { seg_no: 5, offset: 0 }).is_some());
+        assert_eq!(w.remove(&id), Some(value(5, 0, 2)));
         assert_eq!(index.len(), 0);
         assert!(w.get(&id).is_none());
     }
 
     #[test]
-    fn pin_and_access_flag() {
+    fn pin_and_relocation() {
         let index = Arc::new(Index::new(16, usize::MAX));
         let segments = SegmentTable::new(4);
         let mut w = IndexWriter::new(index.clone());
@@ -916,14 +888,15 @@ mod tests {
         w.insert_if_newer(id, value(2, 0, 1));
         let slot = index.register().unwrap();
         let v = index.get_and_pin(&slot, &id, &segments).unwrap();
-        assert!(!v.is_accessed(), "the returned snapshot predates the mark");
-        assert!(index.get(&slot, &id).unwrap().is_accessed());
+        assert_eq!(index.get(&slot, &id), Some(v));
         assert_eq!(segments.pins(2), 1);
         segments.unpin(2);
         assert_eq!(segments.pins(2), 0);
-        // Relocation starts a fresh access history.
         assert!(w.replace_if_at(&id, v.loc, value(3, 0, 2)));
-        assert!(!w.get(&id).unwrap().is_accessed());
+        assert_eq!(index.get_and_pin(&slot, &id, &segments), Some(value(3, 0, 2)));
+        assert_eq!(segments.pins(2), 0);
+        assert_eq!(segments.pins(3), 1);
+        segments.unpin(3);
         index.unregister(slot);
     }
 

@@ -24,7 +24,7 @@ use std::{collections::HashMap, sync::Arc};
 use moat_common::{ChunkId, HugePages, PoolOptions};
 use moat_engine::{
     DeleteOutcome, Engine, Error, FormatOptions, IoQueue, MemDevice, Options, Outcome, PutOptions, PutOutcome,
-    QueueOptions, Reader, ReclaimPolicy, Writer, blocking,
+    QueueOptions, Reader, Writer, blocking,
     io::{CompletionOrder, SyncQueue},
 };
 
@@ -124,8 +124,8 @@ fn seal(q: &mut dyn IoQueue, writer: &mut Writer) {
     blocking::seal(q, writer).unwrap();
 }
 
-fn reclaim(q: &mut dyn IoQueue, writer: &mut Writer, policy: ReclaimPolicy) -> Option<moat_engine::ReclaimReport> {
-    blocking::reclaim(q, writer, policy).unwrap()
+fn reclaim(q: &mut dyn IoQueue, writer: &mut Writer) -> Option<moat_engine::ReclaimReport> {
+    blocking::reclaim(q, writer).unwrap()
 }
 
 fn delete(q: &mut dyn IoQueue, writer: &mut Writer, id: &ChunkId) -> bool {
@@ -741,7 +741,7 @@ fn torn_tail_never_returns_wrong_data() {
 }
 
 #[test]
-fn bit_rot_in_sealed_value_is_detected_and_reclaim_drops_it() {
+fn bit_rot_in_sealed_value_aborts_reclaim_without_deleting_it() {
     for verify_reads in [false, true] {
         let device = new_device(4);
         let engine = open_with(
@@ -789,13 +789,72 @@ fn bit_rot_in_sealed_value_is_detected_and_reclaim_drops_it() {
                 );
             }
         }
-        // Reclaim drops the rotten record instead of copying it forward, and
-        // keeps its intact neighbour.
-        let report = reclaim(&mut q, &mut writer, ReclaimPolicy::Storage).unwrap();
-        assert_eq!(report.corrupt, 1);
-        assert_eq!(report.relocated, 1);
-        assert!(!engine.contains(&id(5)));
+        // Corruption must not authorize deletion or reuse of the victim.
+        let free_before = writer.free_segments();
+        let location = engine.stat(&id(5)).unwrap();
+        assert!(matches!(blocking::reclaim(&mut q, &mut writer), Err(Error::Corrupt(_))));
+        assert_eq!(writer.free_segments(), free_before);
+        assert_eq!(engine.stat(&id(5)).unwrap(), location);
         assert_eq!(read(&mut q, &mut reader, &id(6)).unwrap(), b"neighbour");
+        // The original bytes remain available for repair and a later retry.
+        device.with_data_mut(|d| d[pos + 70_000] ^= 1);
+        let report = reclaim(&mut q, &mut writer).unwrap();
+        assert_eq!(report.relocated, 2);
+        assert_eq!(report.dropped, 0);
+        assert_eq!(read(&mut q, &mut reader, &id(5)).unwrap(), v);
+    }
+}
+
+#[test]
+fn corrupt_batch_header_aborts_reclaim_without_freeing_the_segment() {
+    let device = new_device(4);
+    let (engine, mut q, mut writer, mut reader) = setup(&device);
+    put(&mut q, &mut writer, id(1), b"first", PutOptions::default());
+    flush(&mut q, &mut writer);
+    put(&mut q, &mut writer, id(2), b"second", PutOptions::default());
+    seal(&mut q, &mut writer);
+    let location = engine.stat(&id(1)).unwrap();
+    let free_before = writer.free_segments();
+    let header = (SEGMENT * (location.segment as u64 + 1) + moat_engine::layout::SEGMENT_HEADER_LEN) as usize;
+    device.with_data_mut(|d| d[header] ^= 1);
+    assert!(matches!(blocking::reclaim(&mut q, &mut writer), Err(Error::Corrupt(_))));
+    assert_eq!(writer.free_segments(), free_before);
+    assert_eq!(engine.stat(&id(1)).unwrap(), location);
+    assert_eq!(read(&mut q, &mut reader, &id(2)).unwrap(), b"second");
+    device.with_data_mut(|d| d[header] ^= 1);
+    let report = reclaim(&mut q, &mut writer).unwrap();
+    assert_eq!(report.relocated, 2);
+    assert_eq!(report.dropped, 0);
+}
+
+#[test]
+fn reclaim_preserves_unread_chunks_and_allows_only_one_pass() {
+    let device = new_device(12);
+    let (_engine, mut q, mut writer, reader) = setup(&device);
+    for i in 0..100u128 {
+        put(
+            &mut q,
+            &mut writer,
+            id(i),
+            &value_for(i, 0, 48 << 10),
+            PutOptions::default(),
+        );
+    }
+    seal(&mut q, &mut writer);
+    let victim = writer.pick_victim().unwrap();
+    let ticket = writer.reclaim(&mut q).unwrap().unwrap();
+    assert!(matches!(writer.reclaim(&mut q), Err(Error::Busy)));
+    let Outcome::Reclaim(report) = blocking::wait(&mut q, &mut writer, ticket).unwrap() else {
+        panic!("expected reclaim completion");
+    };
+    assert_eq!(report.seg_no, victim);
+    assert!(report.relocated > 0);
+    assert_eq!(report.dropped, 0);
+    close(&mut q, writer);
+    reader.detach(&mut q);
+    let (_engine, mut q, _writer, mut reader) = setup(&device);
+    for i in 0..100u128 {
+        assert_eq!(read(&mut q, &mut reader, &id(i)).unwrap(), value_for(i, 0, 48 << 10));
     }
 }
 
@@ -899,7 +958,7 @@ fn reclaim_storage_keeps_every_live_chunk() {
         }
         flush(&mut q, &mut writer);
         while writer.free_segments() < 6 {
-            let report = reclaim(&mut q, &mut writer, ReclaimPolicy::Storage).expect("victim");
+            let report = reclaim(&mut q, &mut writer).expect("victim");
             assert_eq!(
                 report.records,
                 report.relocated + report.dropped + report.tombstones_relocated + report.tombstones_dropped
@@ -909,7 +968,7 @@ fn reclaim_storage_keeps_every_live_chunk() {
     // A few extra passes exercise the tombstone rules on already-compacted
     // segments (relocated records and forwarded tombstones).
     for _ in 0..8 {
-        if writer.free_segments() < 3 || reclaim(&mut q, &mut writer, ReclaimPolicy::Storage).is_none() {
+        if writer.free_segments() < 3 || reclaim(&mut q, &mut writer).is_none() {
             break;
         }
     }
@@ -945,7 +1004,7 @@ fn reclaim_runs_concurrently_with_foreground_writes() {
 
     // Start a reclaim pass and keep writing (overwrites and deletes of keys
     // the pass is relocating) while it runs; poll both to completion.
-    let ticket = writer.reclaim(&mut q, ReclaimPolicy::Storage).unwrap().expect("victim");
+    let ticket = writer.reclaim(&mut q).unwrap().expect("victim");
     let mut done = Vec::new();
     let mut finished = false;
     let mut round = 1u32;
@@ -994,73 +1053,6 @@ fn reclaim_runs_concurrently_with_foreground_writes() {
             model.get(&k).cloned(),
             "key {k} after reopen"
         );
-    }
-}
-
-#[test]
-fn reclaim_cache_evicts_oldest_and_reinserts_accessed() {
-    let device = new_device(12);
-    let (engine, mut q, mut writer, mut reader) = setup(&device);
-    // Fill several segments with 48 KiB values (packed, ~20 per segment).
-    for i in 0..100u128 {
-        put(
-            &mut q,
-            &mut writer,
-            id(i),
-            &value_for(i, 0, 48 << 10),
-            PutOptions::default(),
-        );
-    }
-    seal(&mut q, &mut writer);
-    let free_before = writer.free_segments();
-
-    // Touch the even keys among the oldest records.
-    for i in (0..20u128).step_by(2) {
-        read(&mut q, &mut reader, &id(i)).unwrap();
-    }
-
-    let report = reclaim(
-        &mut q,
-        &mut writer,
-        ReclaimPolicy::Cache {
-            reinsert_accessed: true,
-        },
-    )
-    .unwrap();
-    assert!(report.relocated > 0 && report.dropped > 0);
-    assert_eq!(
-        writer.free_segments(),
-        free_before + 1 - u32::from(report.relocated > 0)
-    );
-    for i in 0..report.records as u128 {
-        let present = engine.contains(&id(i));
-        assert_eq!(present, i % 2 == 0, "key {i}");
-    }
-
-    // Pure FIFO: the next oldest segment is dropped wholesale.
-    let victim = writer
-        .pick_victim(ReclaimPolicy::Cache {
-            reinsert_accessed: false,
-        })
-        .unwrap();
-    let report = reclaim(
-        &mut q,
-        &mut writer,
-        ReclaimPolicy::Cache {
-            reinsert_accessed: false,
-        },
-    )
-    .unwrap();
-    assert_eq!(report.seg_no, victim);
-    assert_eq!(report.relocated, 0);
-    assert!(report.dropped > 0);
-    // Only one pass at a time.
-    if let Some(t) = writer.reclaim(&mut q, ReclaimPolicy::Storage).unwrap() {
-        assert!(matches!(
-            writer.reclaim(&mut q, ReclaimPolicy::Storage),
-            Err(Error::Busy)
-        ));
-        blocking::wait(&mut q, &mut writer, t).unwrap();
     }
 }
 
@@ -1203,7 +1195,7 @@ fn randomized_against_model() {
             90..=95 => {
                 flush(&mut q, &mut writer);
                 if writer.free_segments() < 6 {
-                    reclaim(&mut q, &mut writer, ReclaimPolicy::Storage);
+                    reclaim(&mut q, &mut writer);
                 }
             }
             _ => {
@@ -1223,7 +1215,7 @@ fn randomized_against_model() {
         if writer.free_segments() < 3 {
             flush(&mut q, &mut writer);
             for _ in 0..32 {
-                if writer.free_segments() >= 6 || reclaim(&mut q, &mut writer, ReclaimPolicy::Storage).is_none() {
+                if writer.free_segments() >= 6 || reclaim(&mut q, &mut writer).is_none() {
                     break;
                 }
             }
@@ -1294,7 +1286,7 @@ fn concurrent_readers_never_see_torn_values() {
             if writer.free_segments() >= 6 {
                 break;
             }
-            reclaim(&mut q, &mut writer, ReclaimPolicy::Storage).unwrap();
+            reclaim(&mut q, &mut writer).unwrap();
         }
     }
     stop.store(true, Ordering::Relaxed);
@@ -1371,7 +1363,7 @@ fn file_device_roundtrip(backend: moat_engine::QueueBackend) {
         }
         // Reclaim through the selected queue as well.
         seal(q.as_mut(), &mut writer);
-        reclaim(q.as_mut(), &mut writer, ReclaimPolicy::Storage).unwrap();
+        reclaim(q.as_mut(), &mut writer).unwrap();
         for (i, v) in &expected {
             assert_eq!(read(q.as_mut(), &mut reader, &id(*i)).unwrap(), *v);
         }
@@ -1425,7 +1417,7 @@ fn framed_records_roundtrip_recover_and_reclaim() {
     seal(&mut q, &mut writer);
     let mut relocated = 0;
     for _ in 0..4 {
-        if let Some(report) = reclaim(&mut q, &mut writer, ReclaimPolicy::Storage) {
+        if let Some(report) = reclaim(&mut q, &mut writer) {
             relocated += report.relocated;
         }
     }
@@ -1670,7 +1662,7 @@ fn check_scan_window_boundary(mode: &str) {
             flush(&mut q, &mut writer);
             if mode == "reclaim" {
                 seal(&mut q, &mut writer);
-                let report = reclaim(&mut q, &mut writer, ReclaimPolicy::Storage).unwrap();
+                let report = reclaim(&mut q, &mut writer).unwrap();
                 assert_eq!(report.relocated, 6, "{mode}");
                 close(&mut q, writer);
             } else if mode == "bad_footer" {
@@ -1737,7 +1729,7 @@ fn dropping_a_reader_releases_pins_for_submitted_and_queued_reads() {
         } else {
             drop(reader);
         }
-        let ticket = writer.reclaim(&mut q, ReclaimPolicy::Storage).unwrap().unwrap();
+        let ticket = writer.reclaim(&mut q).unwrap().unwrap();
         let mut done = Vec::new();
         let mut reclaimed = false;
         for _ in 0..100 {

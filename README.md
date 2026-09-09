@@ -21,7 +21,7 @@ The design document lives at [`docs/design/chunkserver.md`](docs/design/chunkser
 | Crate | Purpose | State |
 |---|---|---|
 | [`moat-common`](core/moat-common) | Chunk identifiers, CRC32C block checksums, page alignment, huge-page arenas and the buddy buffer pool | usable |
-| [`moat-engine`](core/moat-engine) | Single-disk engine: segments, index, reclaim/eviction, recovery; io_uring with registered buffers, zero-copy read and write paths | usable on raw devices, files and in memory |
+| [`moat-engine`](core/moat-engine) | Single-disk engine: segments, index, GC, recovery; io_uring with registered buffers, zero-copy read and write paths | usable on raw devices, files and in memory |
 | `moat-transport` | RDMA (verbs) and TCP transports behind one protocol | planned |
 | [`moat-server`](core/moat-server) | Multi-disk node: NVMe discovery, placement, recovery and workers | usable without a network transport |
 | `moat-client` | Node routing, connection management, large-object striping | planned |

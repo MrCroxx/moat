@@ -163,21 +163,6 @@ pub struct Completion {
     pub result: Result<Outcome>,
 }
 
-/// How reclaim decides what to keep when it processes a segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReclaimPolicy {
-    /// Every live record is relocated; nothing is ever lost. Victims are the
-    /// sealed segments with the fewest live bytes.
-    Storage,
-    /// Cache semantics: the oldest sealed segment is reclaimed and its live
-    /// records are dropped, except that with `reinsert_accessed` records read
-    /// since they were written are relocated (and their access bit cleared).
-    Cache {
-        /// Relocate records that have been read; drop only the never-read ones.
-        reinsert_accessed: bool,
-    },
-}
-
 /// What a reclaim pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReclaimReport {
@@ -187,7 +172,7 @@ pub struct ReclaimReport {
     pub records: u64,
     /// Live data records copied to a cold segment.
     pub relocated: u64,
-    /// Data records dropped (dead or evicted).
+    /// Obsolete data records dropped.
     pub dropped: u64,
     /// Tombstones copied forward because an older version might still exist.
     pub tombstones_relocated: u64,
@@ -195,8 +180,6 @@ pub struct ReclaimReport {
     pub tombstones_dropped: u64,
     /// Value bytes copied.
     pub bytes_relocated: u64,
-    /// Data records whose value failed its checksums (counted in `dropped`).
-    pub corrupt: u64,
 }
 
 /// A pool buffer laid out as a large batch, with the value area exposed for
@@ -548,7 +531,6 @@ struct ReclaimJob {
     seg_no: u32,
     seq: u64,
     kind: SegmentKind,
-    policy: ReclaimPolicy,
     is_oldest: bool,
     end: u64,
     cursor: u64,
@@ -919,18 +901,18 @@ impl Writer {
         ticket
     }
 
-    /// Starts one reclaim pass under `policy`; the completion reports
+    /// Starts one reclaim pass, relocating live records; the completion reports
     /// [`Outcome::Reclaim`]. `None` if there is no sealed segment to reclaim,
     /// [`Error::Busy`] while a previous pass is still running.
     ///
     /// Relocation needs a free segment for the cold log; callers should
     /// reclaim before the free list is exhausted (keeping at least two free
     /// segments is enough).
-    pub fn reclaim(&mut self, q: &mut dyn IoQueue, policy: ReclaimPolicy) -> Result<Option<Ticket>> {
+    pub fn reclaim(&mut self, q: &mut dyn IoQueue) -> Result<Option<Ticket>> {
         if self.reclaim.is_some() {
             return Err(Error::Busy);
         }
-        let Some(seg_no) = self.pick_victim(policy) else {
+        let Some(seg_no) = self.pick_victim() else {
             return Ok(None);
         };
         let (seq, kind, end) = {
@@ -949,7 +931,6 @@ impl Writer {
             seg_no,
             seq,
             kind,
-            policy,
             is_oldest,
             end,
             cursor: self.shared.geometry.data_start(),
@@ -966,16 +947,14 @@ impl Writer {
         Ok(Some(ticket))
     }
 
-    /// Chooses the segment [`Writer::reclaim`] would process next.
-    pub fn pick_victim(&self, policy: ReclaimPolicy) -> Option<u32> {
+    /// Chooses the sealed segment with the fewest live bytes, breaking ties
+    /// by age, that [`Writer::reclaim`] would process next.
+    pub fn pick_victim(&self) -> Option<u32> {
         let segments = &self.shared.segments;
         segments
             .iter()
             .filter(|&s| segments.state(s) == SegmentState::Sealed)
-            .min_by_key(|&s| match policy {
-                ReclaimPolicy::Storage => (segments.live_bytes(s), segments.seq(s)),
-                ReclaimPolicy::Cache { .. } => (segments.seq(s), 0),
-            })
+            .min_by_key(|&s| (segments.live_bytes(s), segments.seq(s)))
     }
 
     // -- progress -----------------------------------------------------------
@@ -2019,9 +1998,9 @@ impl Writer {
         mut rel: usize,
         mut rec: usize,
     ) -> Result<Option<ReclaimStage>> {
-        let (seg_no, seq, cursor, end, policy, is_oldest) = {
+        let (seg_no, seq, cursor, end, is_oldest) = {
             let job = self.reclaim.as_ref().expect("job exists");
-            (job.seg_no, job.seq, job.cursor, job.end, job.policy, job.is_oldest)
+            (job.seg_no, job.seq, job.cursor, job.end, job.is_oldest)
         };
         loop {
             match next_batch(&buf[..len], rel, seq, self.max_batch, end - cursor - rel as u64) {
@@ -2029,8 +2008,8 @@ impl Writer {
                     let batch_off = cursor + rel as u64;
                     // A structurally corrupt batch aborts the pass without
                     // freeing anything: live records behind it could be lost.
-                    // Value checksums are checked per record below, so one
-                    // rotten value only drops that record.
+                    // Live value checksums are checked per record below and
+                    // likewise abort the pass on corruption.
                     let records = parse_batch(&buf[rel..rel + batch_len], &batch, false)?;
                     for (i, r) in records.iter().enumerate().skip(rec) {
                         let loc = Location {
@@ -2040,7 +2019,7 @@ impl Writer {
                         // Reclaim is off the hot path; copying the checksum
                         // array out keeps the re-encoding API simple.
                         let checksums = r.checksums.to_vec();
-                        match self.reclaim_record(q, &r.header, &checksums, r.value, loc, policy, is_oldest) {
+                        match self.reclaim_record(q, &r.header, &checksums, r.value, loc, is_oldest) {
                             Ok(()) => self.reclaim.as_mut().expect("job exists").report.records += 1,
                             Err(Error::Busy) => {
                                 return Ok(Some(ReclaimStage::Process { buf, len, rel, rec: i }));
@@ -2053,8 +2032,16 @@ impl Writer {
                 }
                 BatchStep::NeedMore => break,
                 BatchStep::End => {
-                    let job = self.reclaim.as_mut().expect("job exists");
-                    job.cursor = job.end;
+                    // A sealed segment has a known data boundary. Unlike an
+                    // active recovery scan, an invalid header before that
+                    // boundary is corruption, not an uncommitted tail.
+                    if cursor + rel as u64 != end {
+                        return Err(Error::corrupt(format!(
+                            "segment {seg_no}: invalid batch at {} before data end {end}",
+                            cursor + rel as u64
+                        )));
+                    }
+                    self.reclaim.as_mut().expect("job exists").cursor = end;
                     return Ok(None);
                 }
             }
@@ -2077,32 +2064,21 @@ impl Writer {
         checksums: &[u32],
         value: &[u8],
         loc: Location,
-        policy: ReclaimPolicy,
         is_oldest: bool,
     ) -> Result<()> {
         match hdr.kind {
             RecordKind::Data => {
-                let Some(current) = self.index.get(&hdr.key).filter(|v| v.loc == loc) else {
+                let Some(_) = self.index.get(&hdr.key).filter(|v| v.loc == loc) else {
                     self.reclaim.as_mut().expect("job exists").report.dropped += 1;
                     return Ok(());
                 };
-                // A value that fails its checksums can never be read again;
-                // it is dropped rather than copied forward.
-                let intact = verify_blocks_with(value, 0, |b| checksums.get(b as usize).copied()).is_ok();
-                let keep = intact
-                    && match policy {
-                        ReclaimPolicy::Storage => true,
-                        ReclaimPolicy::Cache { reinsert_accessed } => reinsert_accessed && current.is_accessed(),
-                    };
-                if !keep {
-                    // Decided before any I/O, so a `Busy` retry cannot repeat it.
-                    self.index.remove_if_at(&hdr.key, loc);
-                    let report = &mut self.reclaim.as_mut().expect("job exists").report;
-                    report.dropped += 1;
-                    if !intact {
-                        report.corrupt += 1;
-                    }
-                    return Ok(());
+                // A corrupt live chunk remains indexed and its segment must
+                // not be reused: repair or deletion is an explicit decision.
+                if let Err(block) = verify_blocks_with(value, 0, |b| checksums.get(b as usize).copied()) {
+                    return Err(Error::corrupt(format!(
+                        "chunk {}: checksum block {block} mismatch during reclaim",
+                        hdr.key
+                    )));
                 }
                 // Relocated records keep their LSN (see the module docs).
                 let apply = Apply::Relocate(loc);
@@ -2210,7 +2186,7 @@ mod tests {
             writer.put(&mut queue, key, b"value", PutOptions::default()).unwrap();
             let ticket = if reclaim {
                 blocking::seal(&mut queue, &mut writer).unwrap();
-                writer.reclaim(&mut queue, ReclaimPolicy::Storage).unwrap().unwrap()
+                writer.reclaim(&mut queue).unwrap().unwrap()
             } else {
                 writer.flush(&mut queue).unwrap()
             };
