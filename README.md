@@ -74,27 +74,33 @@ only the requested pages. Checksum generation and recovery/reclaim validation
 are unchanged.
 Client-side transport and verification are not implemented yet.
 
-## macOS 本地开发
+## Local development on macOS
 
-macOS 使用普通文件和同步 I/O 后端，用于功能开发与测试。可以直接运行：
+macOS uses regular files and synchronous I/O for functional development and
+testing. To try it:
 
 ```sh
 cargo run -p moat-engine --example local
 cargo test --workspace
 ```
 
-示例在临时文件中写入、读取并重新打开一个 4 KiB chunk，退出后自动清理。
-`QueueOptions::build(QueueBackend::Auto)` 在 Linux 选择 io_uring，在 macOS
-选择 `SyncQueue`；可用 `QueueBackend::resolve()` 查看选择结果。Linux 上的
-初始化错误会直接返回。显式指定 `Uring` 在 macOS 上返回 `Unsupported`；
-`MemDevice` 在 Linux 上需要显式指定 `Sync`。
+The example writes and reads a 4 KiB chunk, reopens the temporary file to
+verify recovery, and removes the file on exit.
+`QueueOptions::build(QueueBackend::Auto)` selects io_uring on Linux and
+`SyncQueue` on macOS; `QueueBackend::resolve()` reports the selection.
+Initialization errors on Linux are returned directly. Explicitly selecting
+`Uring` on macOS returns `Unsupported`; `MemDevice` on Linux requires an
+explicit `Sync` selection.
 
-同步后端在调用线程执行阻塞 I/O，然后通过相同的 `poll`/completion 接口交付
-结果，不作为性能路径。Reader、Writer 和磁盘格式不随后端改变。
-macOS 使用 `FileDevice::create/open(..., false)`；显式请求 direct I/O、
-CPU 绑核或强制 huge pages 会返回 `Unsupported`。默认 huge-page 策略降级为
-普通映射，worker 默认使用 `Auto`、不绑核并在空闲时休眠。
-NVMe 自动发现仍仅支持 Linux；macOS 调用方显式提供文件设备。
+The synchronous backend performs blocking I/O on the caller's thread and
+delivers results through the same `poll`/completion interface. It is intended
+for development, not the performance path. Reader, Writer, and the disk format
+are shared by both backends.
+On macOS, use `FileDevice::create/open(..., false)`. Explicit requests for
+direct I/O, CPU pinning, or required huge pages return `Unsupported`.
+The default huge-page policy falls back to plain mappings. Workers default to
+`Auto`, without CPU pinning, and sleep when idle.
+NVMe discovery remains Linux-only; macOS callers supply file devices explicitly.
 
 ## Benchmarking
 
