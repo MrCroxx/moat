@@ -74,7 +74,11 @@ latency on a file or, with `MOAT_BENCH_DEVICE`, a raw device (which it
 **formats**).
 
 `cargo test --workspace` runs the unit tests plus the engine's crash-injection,
-reclaim and randomized model tests against an in-memory device.
+reclaim and randomized model tests, including file-backed io_uring tests on
+Linux. Allow at least 64 MiB of locked memory for the Linux test process;
+registered buffer pools need headroom while queues close and reopen. CI sets
+this limit explicitly. Benchmarks need a limit sized for their configured
+per-worker pools.
 
 Server-side payload CRC verification is disabled by default
 (`Options::verify_reads = false`). Set it to `true` to verify the record header

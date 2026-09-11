@@ -50,8 +50,8 @@ fn store(device: Arc<dyn Device>) -> Store {
     store_on(vec![device], QueueBackend::Sync)
 }
 fn store_on(devices: Vec<Arc<dyn Device>>, backend: QueueBackend) -> Store {
-    // The file fixture uses smaller chunks so both registered pools fit below
-    // an 8 MiB locked-memory limit, including the rings' own allocations.
+    // The file fixture uses smaller chunks to bound registered memory across
+    // both disks. Restart tests also need headroom for old rings to be released.
     let (batch_limit, pool_bytes, max_class) = match backend {
         QueueBackend::Uring => (64 << 10, 2 << 20, 128 << 10),
         _ => (1 << 20, 32 << 20, 1 << 20),
