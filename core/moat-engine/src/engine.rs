@@ -99,9 +99,6 @@ pub struct RecoveryReport {
     pub sealed: u32,
     /// Segments that were active and rebuilt by a forward scan (then sealed).
     pub scanned: u32,
-    /// Segments whose header was unreadable or belonged to another format;
-    /// treated as free. Non-zero values deserve attention.
-    pub unreadable_headers: u32,
     /// Sealed segments whose footer failed validation and were rebuilt by a
     /// forward scan instead (counted in `scanned` as well).
     pub bad_footers: u32,
@@ -139,6 +136,15 @@ impl ChunkStat {
             framed: v.is_framed(),
         }
     }
+}
+
+/// Space accounting for one prospective write under the current engine options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteAccounting {
+    /// Bytes the record contributes to live-byte accounting after completion.
+    pub record_bytes: u64,
+    /// Upper bound for its write batch, including packing and page alignment.
+    pub batch_bytes: u64,
 }
 
 /// Space usage of an engine.
@@ -213,6 +219,44 @@ impl Engine {
     /// The largest value this device accepts.
     pub fn chunk_max(&self) -> u32 {
         self.shared.superblock.chunk_max
+    }
+
+    /// A conservative live-entry budget that avoids index-table growth even
+    /// when deleted slots force a same-size rebuild. This is a management hint
+    /// for upper-layer admission; it does not reserve index slots.
+    pub fn index_entries_without_growth(&self) -> usize {
+        let capacity = self.shared.index.capacity();
+        capacity - capacity / 4 - 1
+    }
+
+    /// Reports physical write costs without allocating or submitting I/O.
+    pub fn write_accounting(&self, len: u32) -> Result<WriteAccounting> {
+        if len > self.chunk_max() {
+            return Err(Error::ValueTooLarge {
+                len: len as u64,
+                max: self.chunk_max() as u64,
+            });
+        }
+        let kind = if len >= self.shared.options.pack_threshold {
+            crate::layout::BatchKind::Large
+        } else {
+            crate::writer::small_batch_kind(len)
+        };
+        let flags = match kind {
+            crate::layout::BatchKind::Inline => 0,
+            crate::layout::BatchKind::Framed => crate::layout::RECORD_FLAG_FRAMED,
+            crate::layout::BatchKind::Large => crate::layout::RECORD_FLAG_LARGE,
+        };
+        let record_bytes = crate::layout::RecordGeometry::footprint(len, flags);
+        let batch_bytes = if kind == crate::layout::BatchKind::Large {
+            record_bytes
+        } else {
+            self.shared.options.batch_limit.next_power_of_two() as u64
+        };
+        Ok(WriteAccounting {
+            record_bytes,
+            batch_bytes,
+        })
     }
 
     /// The device's identity as recorded in the superblock.
@@ -353,13 +397,22 @@ pub fn open(device: Arc<dyn Device>, mut options: Options) -> Result<(Engine, Re
     let mut max_lsn = 0u64;
 
     for seg_no in 0..geometry.segment_count {
-        let header = match shared.read_segment_header(seg_no) {
-            Ok(h) if h.disk_uuid == shared.superblock.disk_uuid && h.seg_no == seg_no => h,
-            _ => {
-                report.unreadable_headers += 1;
-                continue;
-            }
-        };
+        let header = shared.read_segment_header(seg_no)?;
+        if header.disk_uuid != shared.superblock.disk_uuid || header.seg_no != seg_no {
+            return Err(Error::corrupt(format!("segment {seg_no}: header identity mismatch")));
+        }
+        if header.state == SegmentState::Sealed
+            && (header.footer_offset < geometry.data_start()
+                || !header.footer_offset.is_multiple_of(PAGE_SIZE)
+                || header.footer_len == 0
+                || !header.footer_len.is_multiple_of(PAGE_SIZE)
+                || header
+                    .footer_offset
+                    .checked_add(header.footer_len)
+                    .is_none_or(|end| end > geometry.segment_size))
+        {
+            return Err(Error::corrupt(format!("segment {seg_no}: invalid footer extent")));
+        }
         max_seq = max_seq.max(header.seq);
         if header.state == SegmentState::Free {
             continue;
@@ -399,7 +452,7 @@ pub fn open(device: Arc<dyn Device>, mut options: Options) -> Result<(Engine, Re
             }
             None => {
                 report.scanned += 1;
-                let (tail, entries) = scan_segment(&shared, seg_no, header.seq)?;
+                let (tail, entries) = scan_segment(&shared, &header)?;
                 for entry in &entries {
                     report.records += 1;
                     max_lsn = max_lsn.max(entry.lsn);
@@ -443,20 +496,28 @@ pub fn open(device: Arc<dyn Device>, mut options: Options) -> Result<(Engine, Re
 /// Scans a segment forward, verifying every record, and returns the offset at
 /// which valid data ends together with a footer entry per record.
 ///
-/// The first torn or corrupt batch ends the recoverable prefix; nothing after
-/// it was ever acknowledged (or, for a sealed segment with a bad footer, the
-/// remainder is unrecoverable either way).
-fn scan_segment(shared: &Shared, seg_no: u32, seq: u64) -> Result<(u64, Vec<FooterEntry>)> {
+/// Active segments may have an incomplete tail. A sealed segment has a known
+/// data boundary, so corruption before that boundary must fail recovery.
+fn scan_segment(shared: &Shared, header: &SegmentHeader) -> Result<(u64, Vec<FooterEntry>)> {
+    let seg_no = header.seg_no;
+    let sealed = header.state == SegmentState::Sealed;
+    let end = if sealed {
+        header.footer_offset
+    } else {
+        shared.geometry.segment_size
+    };
     let mut entries = Vec::new();
     let tail = scan_batches_blocking(
         shared,
         seg_no,
-        seq,
+        header.seq,
         shared.geometry.data_start(),
-        shared.geometry.segment_size,
+        end,
         |batch_off, batch, bytes| {
-            let Ok(records) = parse_batch(bytes, batch, true) else {
-                return Ok(ControlFlow::Break(()));
+            let records = match parse_batch(bytes, batch, true) {
+                Ok(records) => records,
+                Err(error) if sealed => return Err(error),
+                Err(_) => return Ok(ControlFlow::Break(())),
             };
             for rec in records {
                 entries.push(FooterEntry {
@@ -473,6 +534,11 @@ fn scan_segment(shared: &Shared, seg_no: u32, seq: u64) -> Result<(u64, Vec<Foot
             Ok(ControlFlow::Continue(()))
         },
     )?;
+    if sealed && tail != end {
+        return Err(Error::corrupt(format!(
+            "segment {seg_no}: scan stopped at {tail}, expected {end}"
+        )));
+    }
     Ok((tail, entries))
 }
 

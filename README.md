@@ -24,8 +24,17 @@ The design document lives at [`docs/design/chunkserver.md`](docs/design/chunkser
 | [`moat-engine`](core/moat-engine) | Single-disk engine: segments, index, GC, recovery; io_uring with registered buffers, zero-copy read and write paths | usable on raw devices, files and in memory |
 | `moat-transport` | RDMA (verbs) and TCP transports behind one protocol | planned |
 | [`moat-server`](core/moat-server) | Multi-disk node: NVMe discovery, placement, recovery and workers | usable without a network transport |
+| [`moat-cache-memory`](core/moat-cache-memory) | Sharded weighted resident cache, shared handles, FIFO/LRU/TinyLFU/S3FIFO/SIEVE | implemented; [design and contracts](docs/design/cache-memory.md) |
+| [`moat-cache-store`](core/moat-cache-store) | Bounded async engine adapter and physical read coalescing | implemented; [design and contracts](docs/design/cache-store.md) |
+| [`moat-cache`](core/moat-cache) | Hybrid cache, stable key identity, disk catalog and conditional population | implemented; [design and contracts](docs/design/cache-hybrid.md) |
 | `moat-client` | Node routing, connection management, large-object striping | planned |
 | `moat-tools` | `format`, `fsck`, `dump`, `bench` | planned |
+
+`moat-cache::Cache` returns owned key/value views over shared read buffers.
+Views remain readable after eviction, overwrite and shutdown; callers control
+their lifetime by retaining or dropping entry/field handles. See the
+[view API and retention limits](docs/design/cache-views.md), or run
+`cargo run -p moat-cache --example views`.
 
 ## Trying the engine
 
@@ -65,7 +74,11 @@ latency on a file or, with `MOAT_BENCH_DEVICE`, a raw device (which it
 **formats**).
 
 `cargo test --workspace` runs the unit tests plus the engine's crash-injection,
-reclaim and randomized model tests against an in-memory device.
+reclaim and randomized model tests, including file-backed io_uring tests on
+Linux. Allow at least 64 MiB of locked memory for the Linux test process;
+registered buffer pools need headroom while queues close and reopen. CI sets
+this limit explicitly. Benchmarks need a limit sized for their configured
+per-worker pools.
 
 Server-side payload CRC verification is disabled by default
 (`Options::verify_reads = false`). Set it to `true` to verify the record header
@@ -104,6 +117,13 @@ NVMe discovery remains Linux-only; macOS callers supply file devices explicitly.
 
 ## Benchmarking
 
+The [disk cache comparison](benchmarks/cache-disk/README.md) reports the bytes-only
+moat cache and pinned foyer on one and twenty data disks with matched application
+and I/O worker counts. The [published results](benchmarks/cache-disk/reports/2026-09-10/REPORT.md)
+include all concurrency levels and known limitations. Raw host inventories,
+device identities and local profiling artifacts are not part of the repository.
+The [memory comparison](benchmarks/cache-memory/README.md) covers resident hit
+cost across replacement policies and key sizes.
 Run the engine benchmark without additional configuration to use a temporary
 4 GiB file. The benchmark enables `O_DIRECT` when the backing filesystem
 supports it and falls back to buffered I/O otherwise.

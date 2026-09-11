@@ -55,7 +55,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets
       - name: Test
-        run: cargo test --workspace
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            # Leave headroom for overlapping registered pools during restart tests.
+            sudo prlimit --pid "$$" --memlock=67108864:67108864
+          fi
+          cargo test --workspace
       - name: Local example
         run: cargo run -p moat-engine --example local
       - name: Docs

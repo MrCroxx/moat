@@ -258,7 +258,7 @@ enum Apply {
     /// A record relocated by reclaim: only applies if the index still points
     /// at the old location.
     Relocate(Location),
-    /// A tombstone: the index was updated at delete time.
+    /// A tombstone: remove only versions at or below its LSN on completion.
     Tombstone,
 }
 
@@ -548,14 +548,6 @@ struct Unapplied {
     max_lsn: Lsn,
 }
 
-/// A tombstone that still has to suppress older puts of its key.
-struct Tombstone {
-    lsn: Lsn,
-    /// The tombstone itself is on disk; the entry only lingers while puts of
-    /// the key with a lower LSN are unapplied.
-    applied: bool,
-}
-
 // ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------
@@ -584,8 +576,10 @@ pub struct Writer {
     scratch: Vec<IoCompletion>,
     /// Data records appended but not yet applied, per key.
     unapplied: HashMap<ChunkId, Unapplied, ChunkIdHashBuilder>,
-    /// Tombstones that still outrank unapplied puts of their key.
-    deleted: HashMap<ChunkId, Tombstone, ChunkIdHashBuilder>,
+    /// Newest pending tombstone for the writer's admission view.
+    deleted: HashMap<ChunkId, Lsn, ChunkIdHashBuilder>,
+    /// Completed tombstones that must suppress older, still pending puts.
+    applied_deletes: HashMap<ChunkId, Lsn, ChunkIdHashBuilder>,
     free: VecDeque<u32>,
     /// Batch write tokens are consecutive in submission order, so a
     /// completion is located in `inflight` by subtracting the front token.
@@ -613,7 +607,7 @@ fn batch_slot(kind: BatchKind) -> usize {
 }
 
 /// Chooses how a small (below the pack threshold) value is stored.
-fn small_batch_kind(value_len: u32) -> BatchKind {
+pub(crate) fn small_batch_kind(value_len: u32) -> BatchKind {
     if prefer_framed(value_len) {
         BatchKind::Framed
     } else {
@@ -673,6 +667,7 @@ impl Writer {
             scratch: Vec::new(),
             unapplied: HashMap::default(),
             deleted: HashMap::default(),
+            applied_deletes: HashMap::default(),
             free,
             next_batch_token: 0,
             next_batch_id: 1,
@@ -702,7 +697,7 @@ impl Writer {
     /// followed by [`Writer::put_large`] avoids this copy.
     pub fn put(&mut self, q: &mut dyn IoQueue, id: ChunkId, value: &[u8], opts: PutOptions) -> Result<PutOutcome> {
         self.check_len(value.len() as u64)?;
-        if self.exists(&id, opts) {
+        if self.check_exists(&id, opts)? {
             return Ok(PutOutcome::Exists);
         }
         self.check_index_room(&id)?;
@@ -787,7 +782,7 @@ impl Writer {
         opts: PutOptions,
     ) -> Result<PutOutcome> {
         self.check_len(value.len() as u64)?;
-        if self.exists(&id, opts) {
+        if self.check_exists(&id, opts)? {
             return Ok(PutOutcome::Exists);
         }
         self.check_index_room(&id)?;
@@ -826,20 +821,18 @@ impl Writer {
     ///
     /// The chunk disappears from this writer's view at once (a subsequent put
     /// of the id is not `Exists`) and from readers' when the completion
-    /// reports success, at which point the deletion also survives a crash.
+    /// reports success. Use a flush barrier with the appropriate sync options
+    /// when device durability is required.
     pub fn delete(&mut self, q: &mut dyn IoQueue, id: &ChunkId) -> Result<DeleteOutcome> {
+        if self.deleted.contains_key(id) && !self.exists(id, PutOptions::default()) {
+            return Err(Error::Busy);
+        }
         if !self.exists(id, PutOptions::default()) {
             return Ok(DeleteOutcome::Missing);
         }
         self.reserve_small(q, SegmentKind::Hot, BatchKind::Inline, 0)?;
-        if let Some(old) = self.index.remove(id) {
-            self.shared.segments.sub_live(
-                old.loc.seg_no,
-                RecordGeometry::footprint(old.value_len, old.record_flags()),
-            );
-        }
         let (ticket, lsn) = self.next_ids();
-        self.deleted.insert(*id, Tombstone { lsn, applied: false });
+        self.deleted.insert(*id, lsn);
         let hdr = header(RecordKind::Tombstone, 0, 0, lsn, *id);
         self.append_small(
             q,
@@ -1060,11 +1053,34 @@ impl Writer {
         if opts.overwrite {
             return false;
         }
-        if self.index.get(id).is_some() {
-            return true;
+        let deleted_at = self
+            .deleted
+            .get(id)
+            .copied()
+            .unwrap_or(0)
+            .max(self.applied_deletes.get(id).copied().unwrap_or(0));
+        self.index.get(id).is_some_and(|v| v.lsn > deleted_at)
+            || self.unapplied.get(id).is_some_and(|u| u.max_lsn > deleted_at)
+    }
+
+    fn check_exists(&self, id: &ChunkId, opts: PutOptions) -> Result<bool> {
+        if !self.exists(id, opts) {
+            return Ok(false);
         }
-        let deleted_at = self.deleted.get(id).map_or(0, |t| t.lsn);
-        self.unapplied.get(id).is_some_and(|u| u.max_lsn > deleted_at)
+        let deleted_at = self.deleted.get(id).copied().unwrap_or(0);
+        if self.index.get(id).is_some_and(|v| v.lsn > deleted_at) {
+            Ok(true)
+        } else {
+            // A duplicate cannot acknowledge a write that may still fail.
+            Err(Error::Busy)
+        }
+    }
+
+    /// Visits the completed live inventory while holding the disk's unique
+    /// writer. No disk I/O is performed; pending mutations are excluded.
+    pub fn visit_chunks(&self, mut visitor: impl FnMut(ChunkId, crate::ChunkStat)) {
+        self.index
+            .for_each(|id, value| visitor(*id, crate::ChunkStat::from_value(value)));
     }
 
     fn next_ids(&mut self) -> (Ticket, Lsn) {
@@ -1392,7 +1408,7 @@ impl Writer {
     fn fail_batch(&mut self, batch: Batch, message: &str) {
         for rec in batch.records {
             self.untrack(&rec.entry, rec.apply);
-            if matches!(rec.apply, Apply::Relocate(_))
+            if rec.ticket.is_none()
                 && let Some(job) = &mut self.reclaim
             {
                 job.failed = true;
@@ -1413,23 +1429,13 @@ impl Writer {
                     u.count -= 1;
                     if u.count == 0 {
                         self.unapplied.remove(&entry.key);
-                        // No put of the key is unapplied any more; an applied
-                        // tombstone has nothing left to suppress.
-                        if self.deleted.get(&entry.key).is_some_and(|t| t.applied) {
-                            self.deleted.remove(&entry.key);
-                        }
+                        self.applied_deletes.remove(&entry.key);
                     }
                 }
             }
             Apply::Tombstone => {
-                if let Some(t) = self.deleted.get_mut(&entry.key)
-                    && t.lsn == entry.lsn
-                {
-                    if self.unapplied.contains_key(&entry.key) {
-                        t.applied = true;
-                    } else {
-                        self.deleted.remove(&entry.key);
-                    }
+                if self.deleted.get(&entry.key) == Some(&entry.lsn) {
+                    self.deleted.remove(&entry.key);
                 }
             }
             Apply::Relocate(_) => {}
@@ -1453,9 +1459,9 @@ impl Writer {
         let mut result = Ok(());
         match apply {
             Apply::Insert => {
-                // A tombstone appended after this record (and not yet applied)
-                // supersedes it: the record is on disk but never indexed.
-                let superseded = self.deleted.get(&entry.key).is_some_and(|t| t.lsn > entry.lsn);
+                // Only completed tombstones suppress a put. A pending delete
+                // may fail and must not hide an acknowledged version.
+                let superseded = self.applied_deletes.get(&entry.key).is_some_and(|lsn| *lsn > entry.lsn);
                 if !superseded {
                     match self.index.insert_if_newer(entry.key, value) {
                         InsertOutcome::Inserted => segments.add_live(seg_no, footprint),
@@ -1481,7 +1487,19 @@ impl Writer {
                     segments.add_live(seg_no, footprint);
                 }
             }
-            Apply::Tombstone => {}
+            Apply::Tombstone => {
+                if self.index.get(&entry.key).is_some_and(|v| v.lsn <= entry.lsn) {
+                    let old = self.index.remove(&entry.key).expect("entry exists");
+                    segments.sub_live(
+                        old.loc.seg_no,
+                        RecordGeometry::footprint(old.value_len, old.record_flags()),
+                    );
+                }
+                if self.unapplied.contains_key(&entry.key) {
+                    let watermark = self.applied_deletes.entry(entry.key).or_default();
+                    *watermark = (*watermark).max(entry.lsn);
+                }
+            }
         }
         self.untrack(entry, apply);
         result
@@ -2105,7 +2123,7 @@ impl Writer {
                 // the oldest segment, no older data can exist. Otherwise it is
                 // carried forward with its LSN, so a put of the key that is
                 // still pending keeps outranking it.
-                if self.index.get(&hdr.key).is_some() || is_oldest {
+                if self.index.get(&hdr.key).is_some_and(|v| v.lsn > hdr.lsn) || is_oldest {
                     self.reclaim.as_mut().expect("job exists").report.tombstones_dropped += 1;
                 } else {
                     self.reserve_small(q, SegmentKind::Cold, BatchKind::Inline, 0)?;

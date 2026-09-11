@@ -44,6 +44,14 @@ pub enum NodeError {
     /// A worker failed to start.
     #[error(transparent)]
     Worker(#[from] WorkerError),
+    /// Two disks have the same persistent placement identity.
+    #[error("disks {first} and {second} have the same UUID")]
+    DuplicateIdentity {
+        /// First disk using the identity.
+        first: DiskId,
+        /// Second disk using the identity.
+        second: DiskId,
+    },
     /// The node has no disks.
     #[error("no disks")]
     NoDisks,
@@ -89,6 +97,12 @@ impl Node {
             let (engine, report) = result.map_err(|source| NodeError::Open { disk, source })?;
             engines.push(engine);
             reports.push(report);
+        }
+        let mut identities = std::collections::HashMap::new();
+        for (disk, engine) in engines.iter().enumerate() {
+            if let Some(first) = identities.insert(engine.disk_uuid(), disk) {
+                return Err(NodeError::DuplicateIdentity { first, second: disk });
+            }
         }
         let placement = Placement::new(
             engines
@@ -225,16 +239,45 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_disk_identities_are_rejected() {
+        let devices: Vec<Arc<dyn Device>> = (0..2)
+            .map(|_| {
+                let device = moat_engine::MemDevice::new(4 << 20);
+                moat_engine::format(
+                    &device,
+                    &moat_engine::FormatOptions {
+                        segment_size: 1 << 20,
+                        chunk_max: 64 << 10,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                Arc::new(device) as Arc<dyn Device>
+            })
+            .collect();
+        assert!(matches!(
+            Node::open(
+                devices,
+                Options {
+                    index_capacity: 64,
+                    ..Default::default()
+                }
+            ),
+            Err(NodeError::DuplicateIdentity { first: 0, second: 1 })
+        ));
+    }
+
+    #[test]
     fn owner_assignment_prefers_numa_and_balances() {
         let devices: Vec<Arc<dyn Device>> = (0..4)
-            .map(|_| {
+            .map(|disk| {
                 let d = moat_engine::MemDevice::new(4 << 20);
                 moat_engine::format(
                     &d,
                     &moat_engine::FormatOptions {
                         segment_size: 1 << 20,
                         chunk_max: 64 << 10,
-                        disk_uuid: [1; 16],
+                        disk_uuid: [disk + 1; 16],
                     },
                 )
                 .unwrap();
