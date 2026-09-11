@@ -50,6 +50,12 @@ fn store(device: Arc<dyn Device>) -> Store {
     store_on(vec![device], QueueBackend::Sync)
 }
 fn store_on(devices: Vec<Arc<dyn Device>>, backend: QueueBackend) -> Store {
+    // The file fixture uses smaller chunks so both registered pools fit below
+    // an 8 MiB locked-memory limit, including the rings' own allocations.
+    let (batch_limit, pool_bytes, max_class) = match backend {
+        QueueBackend::Uring => (64 << 10, 2 << 20, 128 << 10),
+        _ => (1 << 20, 32 << 20, 1 << 20),
+    };
     let engines = devices
         .into_iter()
         .map(|device| {
@@ -57,6 +63,7 @@ fn store_on(devices: Vec<Arc<dyn Device>>, backend: QueueBackend) -> Store {
                 device,
                 moat_engine::Options {
                     index_capacity: 1024,
+                    batch_limit,
                     verify_reads: false,
                     ..Default::default()
                 },
@@ -75,8 +82,8 @@ fn store_on(devices: Vec<Arc<dyn Device>>, backend: QueueBackend) -> Store {
                 depth: 8,
                 descriptors: 4,
                 pool: PoolOptions {
-                    bytes: 32 << 20,
-                    max_class: 1 << 20,
+                    bytes: pool_bytes,
+                    max_class,
                     huge_pages: HugePages::Disabled,
                 },
             },
@@ -508,7 +515,7 @@ fn uring_multiple_disks_recover_after_device_order_changes() {
                 &*device,
                 &FormatOptions {
                     segment_size: SEGMENT,
-                    chunk_max: CHUNK_MAX as u32,
+                    chunk_max: 64 << 10,
                     disk_uuid: [index as u8 + 1; 16],
                 },
             )

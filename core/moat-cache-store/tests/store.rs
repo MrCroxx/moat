@@ -52,6 +52,7 @@ fn engine(device: Arc<dyn Device>) -> Engine {
         device,
         moat_engine::Options {
             index_capacity: 1024,
+            batch_limit: 128 << 10,
             verify_reads: true,
             ..Default::default()
         },
@@ -449,25 +450,26 @@ fn uring_file_backend_drives_the_same_adapter_contract() {
         },
     )
     .unwrap();
-    let (store, _) = Store::new(
-        vec![engine(device)],
-        Options {
-            backend: QueueBackend::Uring,
-            ..options()
-        },
-    )
-    .unwrap();
+    let mut options = options();
+    options.backend = QueueBackend::Uring;
+    // Keep registered buffers below a modest locked-memory limit.
+    options.queue.pool.bytes = 4 << 20;
+    options.queue.pool.max_class = 256 << 10;
+    let (store, _) = Store::new(vec![engine(device)], options).unwrap();
     let writes = (0..16)
         .map(|n| store.put(id(n), Arc::from(vec![n as u8; 70_000])))
         .collect::<Vec<_>>();
     for result in block_on(join_all(writes)) {
         result.unwrap();
     }
-    let reads = (0..16).map(|n| store.get(id(n), None)).collect::<Vec<_>>();
-    for (n, result) in block_on(join_all(reads)).into_iter().enumerate() {
-        let chunk = result.unwrap().unwrap();
-        assert!(chunk.iter().all(|&byte| byte == n as u8));
-    }
+    let reads = (0..16).map(|n| {
+        let read = store.get(id(n), None);
+        async move {
+            let chunk = read.await.unwrap().unwrap();
+            assert!(chunk.iter().all(|&byte| byte == n as u8));
+        }
+    });
+    block_on(join_all(reads));
     block_on(store.close()).unwrap();
 }
 
