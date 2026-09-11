@@ -100,7 +100,7 @@ pub mod uring;
 mod writer;
 
 pub use device::{Device, FileDevice, MemDevice};
-pub use engine::{ChunkStat, Engine, RecoveryReport, Usage, format, open};
+pub use engine::{ChunkStat, Engine, RecoveryReport, Usage, WriteAccounting, format, open};
 pub use error::{Error, Result};
 pub use index::{FLAG_FRAMED, FLAG_LARGE, IndexValue, Location, MAX_READERS};
 pub use io::{Descriptor, IoQueue, QueueBackend, QueueOptions};

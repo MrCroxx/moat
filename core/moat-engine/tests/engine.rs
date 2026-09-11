@@ -519,11 +519,11 @@ fn overwrite_semantics() {
     let PutOutcome::Written { lsn: lsn0, .. } = writer.put(&mut q, id(1), &v0, PutOptions::default()).unwrap() else {
         panic!()
     };
-    // A duplicate is rejected even while the first put is still pending.
-    assert_eq!(
-        writer.put(&mut q, id(1), &v1, PutOptions::default()).unwrap(),
-        PutOutcome::Exists
-    );
+    // A pending duplicate cannot be acknowledged before its write succeeds.
+    assert!(matches!(
+        writer.put(&mut q, id(1), &v1, PutOptions::default()),
+        Err(Error::Busy)
+    ));
     flush(&mut q, &mut writer);
     assert_eq!(
         writer.put(&mut q, id(1), &v1, PutOptions::default()).unwrap(),
@@ -600,7 +600,7 @@ fn delete_interleaved_with_pending_puts() {
         writer.delete(&mut q, &id(4)).unwrap(),
         DeleteOutcome::Deleted { .. }
     ));
-    assert!(matches!(writer.delete(&mut q, &id(4)).unwrap(), DeleteOutcome::Missing));
+    assert!(matches!(writer.delete(&mut q, &id(4)), Err(Error::Busy)));
     // Large put (submitted at once) then a small pending put of the same key,
     // then a delete, then a new put: the last put must be what remains.
     let overwrite = PutOptions { overwrite: true };
@@ -721,7 +721,19 @@ fn torn_tail_never_returns_wrong_data() {
                 assert!(damaged > 0);
             });
         }
-        let (_engine, mut q, _writer, mut reader) = setup(&device);
+        // If damage reaches a sealed segment, recovery must refuse to publish
+        // a truncated index and leave the device untouched.
+        let before_open = device.with_data(|data| data.to_vec());
+        let engine = match moat_engine::open(device.clone(), options()) {
+            Ok((engine, _)) => engine,
+            Err(Error::Corrupt(_)) => {
+                assert_eq!(device.with_data(|data| data.to_vec()), before_open);
+                continue;
+            }
+            Err(error) => panic!("unexpected recovery error: {error}"),
+        };
+        let mut q = queue();
+        let mut reader = engine.reader(&mut q).unwrap();
         for (i, v) in &safe {
             assert_eq!(read(&mut q, &mut reader, &id(*i)).unwrap(), *v, "mode {mode} key {i}");
         }
@@ -1129,7 +1141,7 @@ fn open_rejects_unformatted_and_foreign_devices() {
         Err(Error::Unformatted(_))
     ));
 
-    // Segments formatted under a different uuid are treated as free, not as data.
+    // Foreign segment headers must not be treated as reusable free space.
     let device = new_device(4);
     {
         let (_engine, mut q, mut writer, _reader) = setup(&device);
@@ -1153,10 +1165,10 @@ fn open_rejects_unformatted_and_foreign_devices() {
     use moat_engine::Device;
     device.write_at(&sb, 0).unwrap();
     device.write_at(&sb, 4096).unwrap();
-    let (engine, report) = moat_engine::open(device.clone(), options()).unwrap();
-    assert_eq!(report.unreadable_headers, 4);
-    assert_eq!(report.chunks, 0);
-    assert!(!engine.contains(&id(1)));
+    assert!(matches!(
+        moat_engine::open(device.clone(), options()),
+        Err(Error::Corrupt(_))
+    ));
 }
 
 /// Random operations against a reference model, with periodic flushes,
@@ -1532,7 +1544,6 @@ fn footer_room_accounts_for_unapplied_batches() {
     }
     close(&mut q, writer);
     let (engine, report) = moat_engine::open(device.clone(), options()).unwrap();
-    assert_eq!(report.unreadable_headers, 0);
     assert_eq!(report.chunks, n as usize);
     let mut q = queue();
     let mut reader = engine.reader(&mut q).unwrap();
@@ -1745,5 +1756,122 @@ fn dropping_a_reader_releases_pins_for_submitted_and_queued_reads() {
         read_queue.poll(false).unwrap();
         let mut reader = engine.reader(&mut q).unwrap();
         assert_eq!(read(&mut q, &mut reader, &id(1)).unwrap(), b"value");
+    }
+}
+
+#[test]
+fn pending_mutations_preserve_completed_inventory_on_failure() {
+    for order in [CompletionOrder::Fifo, CompletionOrder::Reverse] {
+        let device = new_device(8);
+        let engine = open(&device);
+        let mut q = SyncQueue::new(&queue_options(), order).unwrap();
+        let mut writer = engine.writer(&mut q).unwrap();
+        writer.put(&mut q, id(1), b"value", PutOptions::default()).unwrap();
+        let mut inventory = Vec::new();
+        writer.visit_chunks(|id, stat| inventory.push((id, stat.lsn)));
+        assert!(inventory.is_empty());
+        assert!(matches!(
+            writer.put(&mut q, id(1), b"other", PutOptions::default()),
+            Err(Error::Busy)
+        ));
+        flush(&mut q, &mut writer);
+        blocking::seal(&mut q, &mut writer).unwrap();
+        let original = engine.stat(&id(1)).unwrap().lsn;
+        let DeleteOutcome::Deleted { ticket, .. } = writer.delete(&mut q, &id(1)).unwrap() else {
+            panic!()
+        };
+        writer.visit_chunks(|id, stat| inventory.push((id, stat.lsn)));
+        assert_eq!(inventory, vec![(id(1), original)]);
+        assert!(matches!(writer.delete(&mut q, &id(1)), Err(Error::Busy)));
+        device.fail_writes_in(Some(0..moat_engine::Device::capacity(&*device)));
+        assert!(blocking::wait(&mut q, &mut writer, ticket).is_err());
+        assert_eq!(engine.stat(&id(1)).unwrap().lsn, original);
+        device.fail_writes_in(None);
+        let DeleteOutcome::Deleted { ticket, .. } = writer.delete(&mut q, &id(1)).unwrap() else {
+            panic!()
+        };
+        blocking::wait(&mut q, &mut writer, ticket).unwrap();
+        assert!(!engine.contains(&id(1)));
+        inventory.clear();
+        writer.visit_chunks(|id, stat| inventory.push((id, stat.lsn)));
+        assert!(inventory.is_empty());
+        writer.detach(&mut q);
+        drop(engine);
+        assert!(!open(&device).contains(&id(1)));
+    }
+}
+
+#[test]
+fn recovery_refuses_damaged_headers_and_sealed_suffix_loss_without_writing() {
+    for damage_header in [false, true] {
+        let device = new_device(8);
+        let (engine, mut q, mut writer, reader) = setup(&device);
+        writer.put(&mut q, id(1), b"first", PutOptions::default()).unwrap();
+        flush(&mut q, &mut writer);
+        writer
+            .put(&mut q, id(2), b"intact suffix", PutOptions::default())
+            .unwrap();
+        blocking::seal(&mut q, &mut writer).unwrap();
+        let stat = engine.stat(&id(1)).unwrap();
+        writer.detach(&mut q);
+        reader.detach(&mut q);
+        drop(engine);
+        device.with_data_mut(|bytes| {
+            if damage_header {
+                bytes[(SEGMENT * (stat.segment as u64 + 1)) as usize] ^= 1;
+            } else {
+                let footer = bytes.windows(8).position(|x| x == b"MOATFOT1").unwrap();
+                bytes[footer + 100] ^= 1;
+                bytes[(SEGMENT * (stat.segment as u64 + 1) + stat.value_offset as u64) as usize] ^= 1;
+            }
+        });
+        let before = device.with_data(|bytes| bytes.to_vec());
+        assert!(matches!(
+            moat_engine::open(device.clone(), options()),
+            Err(Error::Corrupt(_))
+        ));
+        assert_eq!(device.with_data(|bytes| bytes.to_vec()), before);
+    }
+}
+
+#[test]
+fn write_accounting_matches_live_usage_across_record_layouts_and_pack_thresholds() {
+    for threshold in [4096, 32 << 10, 128 << 10] {
+        let device = new_device(16);
+        let engine = open_with(
+            &device,
+            Options {
+                pack_threshold: threshold,
+                ..options()
+            },
+        );
+        let mut q = queue();
+        let mut writer = engine.writer(&mut q).unwrap();
+        for (number, len) in [0, 1, 128, 4095, 4096, 8192, 32767, 32768, CHUNK_MAX]
+            .into_iter()
+            .enumerate()
+        {
+            let accounting = engine.write_accounting(len).unwrap();
+            assert!(accounting.batch_bytes >= accounting.record_bytes);
+            let before = engine.usage().live_bytes;
+            put(
+                &mut q,
+                &mut writer,
+                id(number as u128),
+                &vec![1; len as usize],
+                PutOptions::default(),
+            );
+            flush(&mut q, &mut writer);
+            assert_eq!(
+                engine.usage().live_bytes - before,
+                accounting.record_bytes,
+                "threshold={threshold}, len={len}"
+            );
+        }
+        assert!(matches!(
+            engine.write_accounting(CHUNK_MAX + 1),
+            Err(Error::ValueTooLarge { .. })
+        ));
+        close(&mut q, writer);
     }
 }

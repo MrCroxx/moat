@@ -33,16 +33,28 @@ rust-version = "1.90"
 clap = "4"
 colored = "3"
 crc-fast = { version = "1.10", default-features = false, features = ["std"] }
+equivalent = "1"
+futures-channel = "0.3"
+futures-executor = "0.3"
+futures-util = "0.3"
+hashbrown = { version = "0.16", default-features = false }
 io-uring = "0.7"
 libc = "0.2"
 # Moat crates
+moat-cache = { path = "core/moat-cache" }
+moat-cache-memory = { path = "core/moat-cache-memory" }
+moat-cache-store = { path = "core/moat-cache-store" }
 moat-common = { path = "core/moat-common" }
 moat-engine = { path = "core/moat-engine" }
 moat-server = { path = "core/moat-server" }
 parking_lot = "0.12"
+slab = "0.4"
 tempfile = "3"
 thiserror = "2"
 uuid = { version = "1", default-features = false }
+xxhash-rust = { version = "0.8.15", default-features = false, features = [
+  "xxh3",
+] }
 
 # Unsafe code is allowed: the hot paths (io_uring fixed buffers, registered RDMA
 # memory, hugepage arenas, zero-copy views) depend on it. Every unsafe block

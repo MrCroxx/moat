@@ -1,0 +1,5 @@
+/target/
+/private/
+/results/
+/local/
+__pycache__/

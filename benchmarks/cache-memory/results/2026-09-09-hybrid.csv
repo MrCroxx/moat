@@ -1,0 +1,4 @@
+key_bytes,value_bytes,operations,ns_per_memory_hit,ns_per_mixed_get,memory_hits,disk_reads,misses
+16,128,10000,34.79,3183.67,5000,4000,1000
+256,4096,10000,67.61,2914.28,5000,4000,1000
+4096,65536,10000,535.58,6280.88,5000,4000,1000

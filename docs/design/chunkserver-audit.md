@@ -2,7 +2,7 @@ Chunkserver implementation audit (2026-09-09)
 
 The baseline for this audit is `3e481443fc170233e0312ed5f3603cbe6fc75024`. It focuses on data retention, failure retries, and recovery semantics in the implemented engine and node layers. The findings concern actual code; networking, migration, checkpoints, and scheduling described in the design documents are not treated as implemented guarantees. This is not a complete proof of concurrent memory ordering or power-loss consistency.
 
-**Changes in this PR**
+**Changes merged in PR #65**
 
 - Remove `ReclaimPolicy`, cache eviction, `FLAG_ACCESSED`, access-bit updates, and the dedicated conditional removal method. `reclaim(queue)` performs storage GC that retains live chunks; `pick_victim()` selects a sealed segment by live bytes, breaking ties by age.
 - When a live chunk fails checksum verification, GC returns `Corrupt` and retains its index entry and original segment instead of deleting it. Remove `ReclaimReport::corrupt`, which counted these implicit deletions.
@@ -11,7 +11,7 @@ The baseline for this audit is `3e481443fc170233e0312ed5f3603cbe6fc75024`. It fo
 
 Regression tests cover both GC corruption cases: returning an error, retaining the original data location, and successfully retrying after the damaged bytes are repaired. Another test verifies that unread chunks remain readable after GC and restart. Existing randomized model, concurrent read/write, and reclaim tests provide additional coverage.
 
-**Outstanding implementation issues**
+**Findings at the audited baseline**
 
 1. **P1: Recovery treats unreadable segments as free and can resurrect older versions.**
 
@@ -53,7 +53,7 @@ Regression tests cover both GC corruption cases: returning an error, retaining t
 
    Code: [FormatOptions](../../core/moat-engine/src/options.rs), [format](../../core/moat-engine/src/engine.rs), [Node::open](../../core/moat-server/src/node.rs), [Placement](../../core/moat-server/src/placement.rs).
 
-Six independent MemDevice reproductions confirmed the current behavior behind these five findings. They remain unfixed by this PR. Prioritize the two recovery issues, then address pending mutations and duplicate requests together, followed by disk identity validation.
+Six independent MemDevice reproductions confirmed the baseline behavior behind these five findings. PR #65 left them outstanding. The cache implementation branch subsequently added conservative header/sealed recovery, completed-state deletion, Busy responses for unacknowledged duplicates, and duplicate UUID rejection in `Node::open`, with regression tests. Active-tail media-corruption classification and non-PLP persistence ordering remain separate open questions. Formatting still accepts an explicit all-zero identity for single-device use; multi-disk node assembly requires unique persistent identities.
 
 **Existing constraints that need explicit contracts**
 
